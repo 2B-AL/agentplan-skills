@@ -1,0 +1,4 @@
+{
+  "_comment": "Bundled default AgentPlan CUA Skill Gateway (REST) URL. Users can override per-call with --api-base-url or AP_CUA_SKILL_API_BASE_URL.",
+  "api_base_url": "https://sd8t2n41jtbcjjsjsngqg.apigateway-cn-beijing.volceapi.com"
+}
