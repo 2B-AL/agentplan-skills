@@ -794,9 +794,9 @@ def build_parser():
     p = auth.add_parser("status", help="Check the current login state.")
     p.set_defaults(handler=cmd_auth_status, action="auth status")
 
-    p = auth.add_parser("login", help="Configure a Volcengine Ark AgentPlan API key.")
-    p.add_argument("--api-key", help="AgentPlan API key. Prefer the local terminal prompt or AP_CUA_AGENTPLAN_API_KEY.")
-    p.add_argument("--no-prompt", action="store_true", help="Do not prompt; require --api-key or env.")
+    p = auth.add_parser("login", help="Use arkcli or configure a Volcengine Ark AgentPlan API key.")
+    p.add_argument("--api-key", help="Fallback AgentPlan API key. Prefer arkcli or the hidden local prompt.")
+    p.add_argument("--no-prompt", action="store_true", help="Do not prompt; require arkcli, --api-key, or env.")
     p.set_defaults(handler=cmd_auth_login, action="auth login")
 
     p = auth.add_parser("logout", help="Clear the locally cached AgentPlan API key.")
