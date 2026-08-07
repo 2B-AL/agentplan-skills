@@ -47,7 +47,7 @@ If task creation returns `ACTIVE_RUN_CONFLICT`, the new request did not start. S
 ## Safety and result integrity
 
 - Use the bundled gateway in `assets/config.json`; allow the same per-call and environment overrides as `ap-cua-skill`.
-- Reuse an already configured environment or cached credential. When one is not available—or an existing credential is rejected—prefer arkcli: list profiles, require exact `type=agent-plan` plus `plan_tier=max`, and fetch the selected profile with `arkcli profile apikey get --profile <name> --plain`. Keep an arkcli-sourced key only in the current process; never print, log, or copy it into the CUA cache. If arkcli is absent or this flow fails, fall back to the hidden local-terminal prompt and its `0600` cache.
+- Reuse `ARK_AGENTPLAN_API_KEY` or a cached credential when configured. Never treat generic Ark variables such as `ARK_API_KEY` as AgentPlan credentials. When no credential is available—or an existing credential is rejected—prefer arkcli: list profiles, require exact `type=agent-plan` plus `plan_tier=max`, and fetch the selected profile with `arkcli profile apikey get --profile <name> --plain`. Keep an arkcli-sourced key only in the current process; never print, log, or copy it into the CUA cache. If arkcli is absent or this flow fails, fall back to the hidden local-terminal prompt and its `0600` cache.
 - Never expose API keys, cache contents, authorization headers, user answers, or artifact bytes.
 - Never infer completion from progress text or a nonterminal state.
 - Treat `result.text` as authoritative only when `outcome == completed`.

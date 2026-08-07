@@ -19,7 +19,7 @@ from cua_http import gateway_call, raw_request
 from cua_util import RETRYABLE_ERROR_CODES, SkillError, login_setup_command
 
 DEFAULT_LOGIN_TIMEOUT_SEC = 0
-API_KEY_ENV_VARS = ("AP_CUA_AGENTPLAN_API_KEY", "AGENTPLAN_API_KEY", "ARK_API_KEY")
+API_KEY_ENV_VAR = "ARK_AGENTPLAN_API_KEY"
 ARKCLI_TIMEOUT_SEC = 20
 
 
@@ -97,7 +97,7 @@ def _authorized_raw_call_once(state, base_url, method, path, body=None, query=No
 
 def login(state, base_url, api_key=None, prompt=True, **_unused):
     """Configure and validate an AgentPlan API key."""
-    token = _first_non_empty(api_key, *_env_api_keys())
+    token = _first_non_empty(api_key, _env_api_key())
     source = "explicit" if _first_non_empty(api_key) else ("environment" if token else None)
     profile = None
     arkcli_discovery = None
@@ -192,7 +192,7 @@ def logout(state, base_url):
 
 
 def _resolve_credential(state):
-    token = _first_non_empty(*_env_api_keys())
+    token = _first_non_empty(_env_api_key())
     if token:
         return {"token": token, "source": "environment"}, None
     if state.access_token:
@@ -356,8 +356,8 @@ def _is_agentplan_auth_rejection(exc):
     )
 
 
-def _env_api_keys():
-    return [os.environ.get(name) for name in API_KEY_ENV_VARS]
+def _env_api_key():
+    return os.environ.get(API_KEY_ENV_VAR)
 
 
 def _first_non_empty(*values):
