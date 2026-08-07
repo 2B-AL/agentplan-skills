@@ -1,8 +1,8 @@
 """Local caches for the AgentPlan CUA Skill CLI.
 
 `AuthState` stores the API base URL, user identity, and AgentPlan API key in
-a 0600 file below ~/.ark-agentplan/ark-cua/auth-schemes/agentplan/ (override
-with AP_CUA_SKILL_AUTH_FILE).
+a 0600 file at ~/.openclaw/ark-cua/auth.json (override with
+AP_CUA_SKILL_AUTH_FILE).
 `SessionState` remembers the last invocation id so weak agents can run
 `watch --last`. Permissions are repaired automatically; if repair fails the CLI
 refuses to continue so credentials are never left world-readable.
@@ -16,7 +16,7 @@ from pathlib import Path
 
 from cua_util import SkillError
 
-DEFAULT_DIR = Path.home() / ".ark-agentplan" / "ark-cua" / "auth-schemes" / "agentplan"
+DEFAULT_DIR = Path.home() / ".openclaw" / "ark-cua"
 DEFAULT_AUTH_FILE = DEFAULT_DIR / "auth.json"
 DEFAULT_SESSION_FILE = DEFAULT_DIR / "session.json"
 
@@ -151,7 +151,7 @@ class SessionState(_JsonFile):
         self.data["last_invocation_id"] = invocation_id
         self.save()
 
-    # The semantic command surface (task/context/schedule/artifact) remembers the
+    # The semantic command surface (task/context/artifact) remembers the
     # most recent id of each kind so weak agents can use `--last-*` instead of
     # threading ids through every call.
     @property
@@ -164,24 +164,13 @@ class SessionState(_JsonFile):
         return self.data.get("last_context_id")
 
     @property
-    def last_schedule_id(self):
-        return self.data.get("last_schedule_id")
-
-    @property
     def last_artifact_id(self):
         return self.data.get("last_artifact_id")
 
-    @property
-    def last_operation_id(self):
-        return self.data.get("last_operation_id")
-
     def set_last(self, **ids):
-        """Persist any of last_task_id / last_context_id / last_schedule_id /
-        last_artifact_id / last_invocation_id / last_operation_id that are
-        provided and non-empty."""
+        """Persist the provided non-empty task, context, artifact, or invocation ids."""
         changed = False
-        for key in ("last_task_id", "last_context_id", "last_schedule_id",
-                    "last_artifact_id", "last_invocation_id", "last_operation_id"):
+        for key in ("last_task_id", "last_context_id", "last_artifact_id", "last_invocation_id"):
             value = ids.get(key)
             if value and self.data.get(key) != value:
                 self.data[key] = value

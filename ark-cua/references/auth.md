@@ -16,12 +16,8 @@ the same API key to CUA runtime model calls.
    to validate it.
 3. On success it returns `status: "logged_in"` and caches the API key locally.
 
-For non-interactive use, set `AP_CUA_AGENTPLAN_API_KEY`. `AGENTPLAN_API_KEY` is
-accepted as a dedicated compatibility alias. `ARK_API_KEY` is accepted only as
-a final generic compatibility fallback: an explicit AgentPlan variable and a
-validated local cache take priority over it. During interactive login, the CLI
-prompts for the AgentPlan key instead of silently consuming `ARK_API_KEY`.
-Never print or log any key.
+For non-interactive use, set `AP_CUA_AGENTPLAN_API_KEY`. `AGENTPLAN_API_KEY` and
+`ARK_API_KEY` are accepted as compatibility aliases. Never print or log the key.
 
 When stdin is not a TTY, `auth login` does not prompt or block. It returns
 `AUTH_REQUIRED` with `setup_command` so the agent can ask the user to perform the
@@ -29,9 +25,8 @@ login in a real local terminal instead of pasting the API key into chat.
 
 ## Local Cache
 
-- Location:
-  `~/.ark-agentplan/ark-cua/auth-schemes/agentplan/auth.json` (the unified
-  launcher sets `AP_CUA_SKILL_AUTH_FILE`).
+- Location: `~/.openclaw/ark-cua/auth.json` (override with
+  `AP_CUA_SKILL_AUTH_FILE`).
 - Permissions: `0600`; the script attempts to repair unsafe permissions and
   refuses to continue if it cannot.
 - `auth.json` holds the API base URL, the API key, last verified user summary,

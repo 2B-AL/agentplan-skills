@@ -1,350 +1,910 @@
 #!/usr/bin/env python3
-"""Unified ARK CUA launcher.
+"""AgentPlan CUA Skill CLI — the single entrypoint an agent calls to drive CUA.
 
-The launcher resolves one explicit deployment scheme, rejects capabilities that
-the selected deployment does not provide, forces scheme-scoped state below
-~/.ark-agentplan/ark-cua, and then execs the complete vendored adapter.
+    python3 <skill_dir>/scripts/cua.py <command> [options]
+
+Every invocation prints exactly one JSON object:
+
+    {"ok": true,  "action": "<command>", "data": {...}, "next": {...}}
+    {"ok": false, "action": "<command>", "error": {"code": "...", "message": "..."}}
+
+Stdlib only. API keys, authorization headers, cache contents, and artifact bytes
+are never printed. See references/ for command and error documentation.
 """
 
+import argparse
+import base64
 import json
 import os
-import stat
 import sys
 import tempfile
+import time
 from pathlib import Path
 
-
-SCHEMES = ("agentplan", "bytesso")
-COMMON_ROOTS = frozenset(
-    {"auth", "ping", "delegate", "watch", "answer", "cancel", "observe", "self-test"}
+import cua_auth
+from cua_state import AuthState, SessionState
+from cua_util import (
+    RETRYABLE_ERROR_CODES,
+    SkillError,
+    emit_error,
+    emit_success,
+    ext_for_mime,
+    login_setup_command,
+    now_epoch,
+    script_path,
 )
-AGENTPLAN_ROOTS = COMMON_ROOTS | frozenset(
-    {
-        "result",
-        "diagnose",
-        "desktop",
-        "desktops",
-        "model",
-        "task",
-        "context",
-        "timeline",
-        "artifact",
-        "schedule",
-    }
-)
-BYTESSO_ROOTS = COMMON_ROOTS | frozenset(
-    {"desktop", "desktops", "tasks", "credentials", "credential-target"}
-)
-AGENTPLAN_DESKTOPS = frozenset(
-    {"list", "access", "revoke-access", "reboot", "reset", "operation"}
-)
-BYTESSO_DESKTOPS = frozenset({"list", "allocate", "use", "reboot", "operation"})
 
-
-def _skill_dir():
-    return Path(__file__).resolve().parent.parent
-
-
-def _config():
-    path = _skill_dir() / "config.json"
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        _error("CONFIG_INVALID", f"Cannot read bundled config: {exc}", stage="scheme_resolution")
-    if not isinstance(data, dict):
-        _error("CONFIG_INVALID", "Bundled config must be a JSON object.", stage="scheme_resolution")
-    return data
-
-
-def _state_root(config):
-    value = os.environ.get("ARK_CUA_STATE_DIR") or config.get("state_root")
-    if not value:
-        value = str(Path.home() / ".ark-agentplan" / "ark-cua")
-    return Path(value).expanduser()
-
-
-def _selection_path(config):
-    return _state_root(config) / "selection.json"
-
-
-def _read_persisted_selection(config):
-    path = _selection_path(config)
-    if not path.exists():
-        return None
-    _secure_existing_file(path)
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        _error("STATE_INVALID", f"Cannot read scheme selection: {exc}", stage="scheme_resolution")
-    scheme = data.get("auth_scheme") if isinstance(data, dict) else None
-    return _validate_scheme(scheme, source="persisted selection") if scheme else None
-
-
-def _write_persisted_selection(config, scheme):
-    path = _selection_path(config)
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    try:
-        os.chmod(path.parent, 0o700)
-        fd, temp_path = tempfile.mkstemp(
-            dir=str(path.parent), prefix=".selection-", suffix=".json"
-        )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump({"auth_scheme": scheme}, handle, ensure_ascii=False, indent=2)
-                handle.write("\n")
-            os.chmod(temp_path, 0o600)
-            os.replace(temp_path, path)
-        finally:
-            if os.path.exists(temp_path):
-                os.unlink(temp_path)
-    except OSError as exc:
-        _error("STATE_WRITE_FAILED", f"Cannot save scheme selection: {exc}", stage="scheme_resolution")
-
-
-def _reset_persisted_selection(config):
-    path = _selection_path(config)
-    if not path.exists():
-        return
-    _secure_existing_file(path)
-    try:
-        path.unlink()
-    except OSError as exc:
-        _error("STATE_WRITE_FAILED", f"Cannot reset scheme selection: {exc}", stage="scheme_resolution")
-
-
-def _secure_existing_file(path):
-    try:
-        info = path.lstat()
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-            _error("STATE_INVALID", f"State path is not a regular file: {path}", stage="scheme_resolution")
-        if stat.S_IMODE(info.st_mode) != 0o600:
-            os.chmod(path, 0o600)
-    except OSError as exc:
-        _error("STATE_INVALID", f"Cannot secure state file: {exc}", stage="scheme_resolution")
-
-
-def _validate_scheme(value, source):
-    normalized = str(value or "").strip().lower()
-    if normalized not in SCHEMES:
-        _error(
-            "INVALID_AUTH_SCHEME",
-            f"Unsupported auth scheme from {source}: {value!r}.",
-            stage="scheme_resolution",
-            available_schemes=list(SCHEMES),
-        )
-    return normalized
-
-
-def _extract_cli_scheme(argv):
-    scheme = None
-    remaining = []
-    index = 0
-    while index < len(argv):
-        item = argv[index]
-        if item == "--auth-scheme":
-            if scheme is not None:
-                _error("VALIDATION_ERROR", "--auth-scheme may be specified only once.")
-            if index + 1 >= len(argv):
-                _error("VALIDATION_ERROR", "--auth-scheme requires agentplan or bytesso.")
-            scheme = _validate_scheme(argv[index + 1], source="--auth-scheme")
-            index += 2
-            continue
-        if item.startswith("--auth-scheme="):
-            if scheme is not None:
-                _error("VALIDATION_ERROR", "--auth-scheme may be specified only once.")
-            scheme = _validate_scheme(item.split("=", 1)[1], source="--auth-scheme")
-            index += 1
-            continue
-        remaining.append(item)
-        index += 1
-    return scheme, remaining
-
-
-def _resolve_scheme(config, cli_scheme):
-    if cli_scheme:
-        return cli_scheme, "cli"
-    env_scheme = os.environ.get("ARK_CUA_AUTH_SCHEME")
-    if env_scheme:
-        return _validate_scheme(env_scheme, source="ARK_CUA_AUTH_SCHEME"), "environment"
-    persisted = _read_persisted_selection(config)
-    if persisted:
-        return persisted, "persisted"
-    default = config.get("default_auth_scheme") or "agentplan"
-    return _validate_scheme(default, source="bundled default"), "default"
-
-
-def _handle_scheme_command(config, argv, cli_scheme):
-    if not argv or argv[0] != "auth-scheme":
-        return False
-    subcommand = argv[1] if len(argv) > 1 else "status"
-    if subcommand == "status" and len(argv) == 2:
-        scheme, source = _resolve_scheme(config, cli_scheme)
-        _success(
-            "auth-scheme status",
-            {
-                "auth_scheme": scheme,
-                "source": source,
-                "default": config.get("default_auth_scheme") or "agentplan",
-                "state_root": str(_state_root(config)),
-                "available_schemes": list(SCHEMES),
-            },
-        )
-    if subcommand == "use" and len(argv) == 3:
-        scheme = _validate_scheme(argv[2], source="auth-scheme use")
-        _write_persisted_selection(config, scheme)
-        _success(
-            "auth-scheme use",
-            {"auth_scheme": scheme, "source": "persisted", "state_root": str(_state_root(config))},
-        )
-    if subcommand == "reset" and len(argv) == 2:
-        _reset_persisted_selection(config)
-        scheme = _validate_scheme(
-            config.get("default_auth_scheme") or "agentplan", source="bundled default"
-        )
-        _success(
-            "auth-scheme reset",
-            {"auth_scheme": scheme, "source": "default", "state_root": str(_state_root(config))},
-        )
-    _error(
-        "VALIDATION_ERROR",
-        "Usage: auth-scheme status | auth-scheme use <agentplan|bytesso> | auth-scheme reset",
-    )
-    return True
-
-
-def _command_path(argv):
-    known_roots = AGENTPLAN_ROOTS | BYTESSO_ROOTS | frozenset({"auth-scheme"})
-    for index, item in enumerate(argv):
-        if item not in known_roots:
-            continue
-        subcommand = None
-        for candidate in argv[index + 1 :]:
-            if not candidate.startswith("-"):
-                subcommand = candidate
-                break
-        return item, subcommand
-    return None, None
-
-
-def _capability_gate(scheme, argv):
-    root, subcommand = _command_path(argv)
-    if not root or root in ("-h", "--help"):
-        return
-    allowed_roots = AGENTPLAN_ROOTS if scheme == "agentplan" else BYTESSO_ROOTS
-    if root not in allowed_roots:
-        _capability_unavailable(scheme, " ".join(x for x in (root, subcommand) if x))
-
-    if root in ("desktop", "desktops") and subcommand:
-        allowed = AGENTPLAN_DESKTOPS if scheme == "agentplan" else BYTESSO_DESKTOPS
-        if subcommand not in allowed:
-            _capability_unavailable(scheme, f"desktops {subcommand}")
-
-    if root == "delegate" and scheme == "agentplan":
-        if "--auto" in argv:
-            _capability_unavailable(scheme, "delegate --auto", available_in=["bytesso"])
-        if "--session-id" in argv or any(item.startswith("--session-id=") for item in argv):
-            _capability_unavailable(
-                scheme, "delegate --session-id", available_in=["bytesso"]
-            )
-
-
-def _capability_unavailable(scheme, command, available_in=None):
-    if available_in is None:
-        other = "bytesso" if scheme == "agentplan" else "agentplan"
-        available_in = [other]
-    _error(
-        "CAPABILITY_UNAVAILABLE",
-        f"{command!r} is not available under auth scheme {scheme!r}.",
-        stage="capability_gate",
-        scheme=scheme,
-        command=command,
-        available_in=available_in,
-    )
-
-
-def _adapter_argv(scheme, argv):
-    translated = list(argv)
-    if translated:
-        if scheme == "agentplan" and translated[0] == "desktops":
-            translated[0] = "desktop"
-        elif scheme == "bytesso" and translated[0] == "desktop":
-            translated[0] = "desktops"
-    return translated
-
-
-def _adapter_environment(config, scheme):
-    env = os.environ.copy()
-    root = _state_root(config)
-    scheme_root = root / "auth-schemes" / scheme
-    env["ARK_CUA_ENTRYPOINT"] = str(Path(__file__).resolve())
-    env["ARK_CUA_ACTIVE_SCHEME"] = scheme
-
-    if scheme == "agentplan":
-        env["AP_CUA_SKILL_AUTH_FILE"] = str(scheme_root / "auth.json")
-        env["AP_CUA_SKILL_SESSION_FILE"] = str(scheme_root / "session.json")
-        env["CUA_SKILL_AUTH_FILE"] = str(scheme_root / "auth.json")
-        env["CUA_SKILL_SESSION_FILE"] = str(scheme_root / "session.json")
-        override = env.get("ARK_CUA_AGENTPLAN_API_BASE_URL")
-        if override:
-            env["AP_CUA_SKILL_API_BASE_URL"] = override
-    else:
-        env["CUA_SKILL_AUTH_FILE"] = str(scheme_root / "auth.json")
-        env["CUA_SKILL_SESSION_FILE"] = str(scheme_root / "session.json")
-        env["ARK_CUA_BYTESSO_RUNTIME_ROOT"] = str(root / "runtime" / "bytesso")
-        access_hub = env.get("ARK_CUA_BYTESSO_ACCESS_HUB_BASE_URL")
-        gateway = env.get("ARK_CUA_BYTESSO_SKILL_GATEWAY_URL")
-        if access_hub:
-            env["CUA_SKILL_ACCESS_HUB_BASE_URL"] = access_hub
-        if gateway:
-            env["CUA_SKILL_GATEWAY_URL"] = gateway
-    return env
-
-
-def _adapter_script(scheme):
-    path = _skill_dir() / "vendor" / scheme / "scripts" / "cua.py"
-    if not path.is_file():
-        _error(
-            "INSTALL_INCOMPLETE",
-            f"Missing {scheme} adapter: {path}",
-            stage="adapter_resolution",
-        )
-    return path
-
-
-def _success(action, data):
-    print(json.dumps({"ok": True, "action": action, "data": data}, ensure_ascii=False))
-    raise SystemExit(0)
-
-
-def _error(code, message, stage="local_validation", **details):
-    error = {
-        "error_schema_version": "ark-cua.error.v1",
-        "code": code,
-        "message": message,
-        "source": "unified_cli",
-        "stage": stage,
-        "accepted": False,
-    }
-    error.update({key: value for key, value in details.items() if value is not None})
-    payload = {"ok": False, "action": "ark-cua", "error": error}
-    line = json.dumps(payload, ensure_ascii=False)
-    print(line)
-    print(line, file=sys.stderr)
-    raise SystemExit(1)
+# Long tasks use repeated waits. Each request stays within the gateway's 60-second
+# server limit while the CLI tracks the user's larger total wait budget.
+DEFAULT_WATCH_WAIT_MS = 20000
+RESULT_POLL_WAIT_MS = 20000
+SERVER_WAIT_CHUNK_MS = 60000
+IDEMPOTENT_RETRIES = 2
 
 
 def main(argv=None):
-    raw_argv = list(sys.argv[1:] if argv is None else argv)
-    config = _config()
-    cli_scheme, remaining = _extract_cli_scheme(raw_argv)
-    _handle_scheme_command(config, remaining, cli_scheme)
-    scheme, _source = _resolve_scheme(config, cli_scheme)
-    _capability_gate(scheme, remaining)
-    adapter = _adapter_script(scheme)
-    adapter_argv = _adapter_argv(scheme, remaining)
-    env = _adapter_environment(config, scheme)
-    os.execve(sys.executable, [sys.executable, str(adapter), *adapter_argv], env)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    action = getattr(args, "action", None)
+    if not action:
+        parser.print_help(sys.stderr)
+        return 2
+    try:
+        state = AuthState.load()
+        session = SessionState.load()
+        data = args.handler(args, state, session)
+        emit_success(action, data)
+    except SkillError as exc:
+        emit_error(action, exc)
+    except BrokenPipeError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - surface unexpected errors as JSON, not tracebacks
+        emit_error(action, SkillError("INTERNAL", str(exc)))
+
+
+# -- base URL --------------------------------------------------------------
+
+
+def resolve_base_url(args, state, persist=False):
+    base_url = (
+        args.api_base_url
+        or os.environ.get("AP_CUA_SKILL_API_BASE_URL")
+        or os.environ.get("CUA_SKILL_API_BASE_URL")
+        or state.api_base_url
+        or bundled_base_url()
+    )
+    if not base_url:
+        raise SkillError(
+            "VALIDATION_ERROR",
+            "No CUA gateway configured. Set api_base_url in the skill's assets/config.json, "
+            "pass --api-base-url, or set AP_CUA_SKILL_API_BASE_URL.",
+        )
+    base_url = base_url.rstrip("/")
+    if persist and state.api_base_url != base_url:
+        state.set_api_base_url(base_url)
+    return base_url
+
+
+def bundled_base_url():
+    """Gateway URL shipped as a bundled asset (publisher-set, once)."""
+    try:
+        cfg_path = Path(__file__).resolve().parent.parent / "assets" / "config.json"
+        if not cfg_path.exists():
+            return None
+        data = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    url = data.get("api_base_url") if isinstance(data, dict) else None
+    if not isinstance(url, str):
+        return None
+    url = url.strip()
+    if not url or url.startswith("<") or "REPLACE" in url or "example.com" in url:
+        return None
+    return url
+
+
+# -- auth commands ---------------------------------------------------------
+
+
+def cmd_auth_status(args, state, session):
+    base_url = resolve_base_url(args, state)
+    return {"data": cua_auth.auth_status(state, base_url)}
+
+
+def cmd_auth_login(args, state, session):
+    base_url = resolve_base_url(args, state, persist=True)
+    return {"data": cua_auth.login(
+        state, base_url,
+        api_key=args.api_key,
+        prompt=not args.no_prompt,
+    )}
+
+
+def cmd_auth_logout(args, state, session):
+    base_url = resolve_base_url(args, state)
+    return {"data": cua_auth.logout(state, base_url)}
+
+
+# -- CUA commands ----------------------------------------------------------
+
+
+def cmd_ping(args, state, session):
+    base_url = resolve_base_url(args, state)
+    return {"data": cua_auth.authorized_call(state, base_url, "GET", "/v1/ping", retries=IDEMPOTENT_RETRIES)}
+
+
+def cmd_delegate(args, state, session):
+    base_url = resolve_base_url(args, state)
+    _validate_wait_ms(args.wait_ms)
+    # Always create without a synchronous wait so the invocation id is captured
+    # before any long polling. This prevents a timeout from causing a duplicate
+    # task submission.
+    body = {"objective": args.objective, "wait_ms": 0}
+    envelope = cua_auth.authorized_call(
+        state, base_url, "POST", "/v1/invocations", body=body, timeout=_call_timeout(0)
+    )
+    envelope = _wait_invocation_with_budget(
+        state, base_url, envelope.get("invocation_id"), args.wait_ms, initial_envelope=envelope
+    )
+    return _envelope_result("delegate", envelope, session)
+
+
+def cmd_watch(args, state, session):
+    base_url = resolve_base_url(args, state)
+    invocation_id = _resolve_invocation_id(args, session)
+    envelope = _wait_invocation_with_budget(state, base_url, invocation_id, args.wait_ms)
+    return _envelope_result("watch", envelope, session)
+
+
+def cmd_answer(args, state, session):
+    base_url = resolve_base_url(args, state)
+    _validate_wait_ms(args.wait_ms)
+    invocation_id = _resolve_invocation_id(args, session)
+    body = {"answer": args.answer, "wait_ms": 0}
+    envelope = cua_auth.authorized_call(
+        state, base_url, "POST", f"/v1/invocations/{invocation_id}/answer",
+        body=body, timeout=_call_timeout(0)
+    )
+    envelope = _wait_invocation_with_budget(
+        state, base_url, invocation_id, args.wait_ms, initial_envelope=envelope
+    )
+    return _envelope_result("answer", envelope, session)
+
+
+def cmd_cancel(args, state, session):
+    base_url = resolve_base_url(args, state)
+    invocation_id = _resolve_invocation_id(args, session)
+    data = cua_auth.authorized_call(
+        state, base_url, "POST", f"/v1/invocations/{invocation_id}/cancel", retries=IDEMPOTENT_RETRIES
+    )
+    return {"data": data}
+
+
+def cmd_result(args, state, session):
+    base_url = resolve_base_url(args, state)
+    invocation_id = _resolve_invocation_id(args, session)
+    deadline = now_epoch() + max(1, args.timeout)
+    envelope = None
+    while now_epoch() < deadline:
+        try:
+            if envelope is None:
+                envelope = cua_auth.authorized_call(
+                    state, base_url, "GET", f"/v1/invocations/{invocation_id}", retries=IDEMPOTENT_RETRIES
+                )
+            if envelope.get("outcome") != "in_progress":
+                break
+            envelope = cua_auth.authorized_call(
+                state, base_url, "POST", f"/v1/invocations/{invocation_id}/watch",
+                body={"wait_ms": RESULT_POLL_WAIT_MS}, timeout=_call_timeout(RESULT_POLL_WAIT_MS),
+                retries=IDEMPOTENT_RETRIES
+            )
+        except SkillError as exc:
+            # Transient gateway/backend timeout — the task is still running; keep polling.
+            if exc.code in RETRYABLE_ERROR_CODES:
+                envelope = None
+                time.sleep(2)
+                continue
+            raise
+    if envelope is None:
+        # Could not reach a state read within the deadline; report in_progress.
+        envelope = cua_auth.authorized_call(
+            state, base_url, "GET", f"/v1/invocations/{invocation_id}", retries=IDEMPOTENT_RETRIES
+        )
+    return _envelope_result("result", envelope, session)
+
+
+# -- semantic commands -----------------------------------------------------
+
+
+def cmd_diagnose(args, state, session):
+    base_url = resolve_base_url(args, state)
+    data = cua_auth.authorized_call(state, base_url, "GET", "/v1/diagnostics", retries=IDEMPOTENT_RETRIES)
+    return {"data": data}
+
+
+def cmd_desktop_list(args, state, session):
+    base_url = resolve_base_url(args, state)
+    data = cua_auth.authorized_call(state, base_url, "GET", "/v1/desktop-options", retries=IDEMPOTENT_RETRIES)
+    return {"data": data}
+
+
+def cmd_model_get(args, state, session):
+    base_url = resolve_base_url(args, state)
+    data = cua_auth.authorized_call(state, base_url, "GET", "/v1/model-config", retries=IDEMPOTENT_RETRIES)
+    return {"data": data, "next": {
+        "agent_hint": "This is the default model config for future CUA delegations on the bound desktop.",
+    }}
+
+
+def cmd_task_run(args, state, session):
+    base_url = resolve_base_url(args, state)
+    _validate_wait_ms(args.wait_ms)
+    body = {"objective": args.objective, "wait_ms": 0}
+    if args.desktop:
+        body["desktop"] = args.desktop
+    if args.title:
+        body["title"] = args.title
+    envelope = cua_auth.authorized_call(
+        state, base_url, "POST", "/v1/tasks", body=body, timeout=_call_timeout(0)
+    )
+    envelope = _wait_invocation_with_budget(
+        state, base_url, envelope.get("invocation_id"), args.wait_ms, initial_envelope=envelope
+    )
+    return _task_result("task run", envelope, session)
+
+
+def cmd_task_continue(args, state, session):
+    base_url = resolve_base_url(args, state)
+    _validate_wait_ms(args.wait_ms)
+    context_id = _resolve_context_id(args, session)
+    body = {"objective": args.objective, "wait_ms": 0}
+    envelope = cua_auth.authorized_call(
+        state, base_url, "POST", f"/v1/contexts/{context_id}/tasks", body=body, timeout=_call_timeout(0)
+    )
+    envelope = _wait_invocation_with_budget(
+        state, base_url, envelope.get("invocation_id"), args.wait_ms, initial_envelope=envelope
+    )
+    return _task_result("task continue", envelope, session)
+
+
+def cmd_task_status(args, state, session):
+    base_url = resolve_base_url(args, state)
+    task_id = _resolve_task_id(args, session)
+    envelope = cua_auth.authorized_call(
+        state, base_url, "GET", f"/v1/tasks/{task_id}", retries=IDEMPOTENT_RETRIES
+    )
+    return _task_result("task status", envelope, session)
+
+
+def cmd_task_result(args, state, session):
+    base_url = resolve_base_url(args, state)
+    task_id = _resolve_task_id(args, session)
+    deadline = now_epoch() + max(1, args.timeout)
+    envelope = None
+    while now_epoch() < deadline:
+        try:
+            envelope = cua_auth.authorized_call(
+                state, base_url, "GET", f"/v1/tasks/{task_id}/result", retries=IDEMPOTENT_RETRIES
+            )
+            if envelope.get("outcome") != "in_progress":
+                break
+            time.sleep(3)
+        except SkillError as exc:
+            if exc.code in RETRYABLE_ERROR_CODES:
+                time.sleep(2)
+                continue
+            raise
+    if envelope is None:
+        envelope = cua_auth.authorized_call(
+            state, base_url, "GET", f"/v1/tasks/{task_id}/result", retries=IDEMPOTENT_RETRIES
+        )
+    return _task_result("task result", envelope, session)
+
+
+def cmd_task_answer(args, state, session):
+    base_url = resolve_base_url(args, state)
+    _validate_wait_ms(args.wait_ms)
+    task_id = _resolve_task_id(args, session)
+    body = {"answer": args.answer, "wait_ms": 0}
+    envelope = cua_auth.authorized_call(
+        state, base_url, "POST", f"/v1/tasks/{task_id}/answer", body=body, timeout=_call_timeout(0)
+    )
+    envelope = _wait_invocation_with_budget(
+        state, base_url, task_id, args.wait_ms, initial_envelope=envelope
+    )
+    return _task_result("task answer", envelope, session)
+
+
+def cmd_task_cancel(args, state, session):
+    base_url = resolve_base_url(args, state)
+    task_id = _resolve_task_id(args, session)
+    data = cua_auth.authorized_call(
+        state, base_url, "POST", f"/v1/tasks/{task_id}/cancel", retries=IDEMPOTENT_RETRIES
+    )
+    return {"data": data}
+
+
+def cmd_context_list(args, state, session):
+    base_url = resolve_base_url(args, state)
+    data = cua_auth.authorized_call(state, base_url, "GET", "/v1/contexts", retries=IDEMPOTENT_RETRIES)
+    return {"data": data}
+
+
+def cmd_context_create(args, state, session):
+    base_url = resolve_base_url(args, state)
+    body = {}
+    if args.title:
+        body["title"] = args.title
+    if args.desktop:
+        body["desktop"] = args.desktop
+    data = cua_auth.authorized_call(state, base_url, "POST", "/v1/contexts", body=body)
+    context_id = data.get("context_id")
+    if context_id:
+        session.set_last(last_context_id=context_id)
+    return {"data": data, "next": {
+        "command": f"python3 {script_path()} task continue --context-id {context_id} --objective \"<TASK>\"",
+        "agent_hint": "Context created. Add background with context add-note, or start work with task continue.",
+    }}
+
+
+def cmd_context_add_note(args, state, session):
+    base_url = resolve_base_url(args, state)
+    context_id = _resolve_context_id(args, session)
+    data = cua_auth.authorized_call(
+        state, base_url, "POST", f"/v1/contexts/{context_id}/notes", body={"text": args.text}
+    )
+    return {"data": data}
+
+
+def cmd_context_show(args, state, session):
+    base_url = resolve_base_url(args, state)
+    context_id = _resolve_context_id(args, session)
+    data = cua_auth.authorized_call(
+        state, base_url, "GET", f"/v1/contexts/{context_id}", retries=IDEMPOTENT_RETRIES
+    )
+    return {"data": data}
+
+
+def cmd_timeline_show(args, state, session):
+    base_url = resolve_base_url(args, state)
+    context_id = _resolve_context_id(args, session)
+    data = cua_auth.authorized_call(
+        state, base_url, "GET", f"/v1/contexts/{context_id}/timeline", retries=IDEMPOTENT_RETRIES
+    )
+    return {"data": data}
+
+
+def cmd_artifact_list(args, state, session):
+    base_url = resolve_base_url(args, state)
+    task_id = _resolve_task_id(args, session)
+    data = cua_auth.authorized_call(
+        state, base_url, "GET", f"/v1/tasks/{task_id}/artifacts", retries=IDEMPOTENT_RETRIES
+    )
+    return {"data": data}
+
+
+def cmd_artifact_save(args, state, session):
+    base_url = resolve_base_url(args, state)
+    artifact_id = args.artifact_id or (session.last_artifact_id if args.last else None)
+    if not artifact_id:
+        raise SkillError("VALIDATION_ERROR", "artifact_id is required. Pass --artifact-id <id> or --last.")
+    task_id = args.task_id or session.last_task_id
+    query = {"task_id": task_id} if task_id else None
+    headers, raw = cua_auth.authorized_raw_call(
+        state, base_url, "GET", f"/v1/artifacts/{artifact_id}/content",
+        query=query, timeout=120, retries=IDEMPOTENT_RETRIES
+    )
+    session.set_last(last_artifact_id=artifact_id)
+    data = _legacy_artifact_envelope(raw, headers)
+    if data is None:
+        mime_type = _content_type(headers)
+        if _looks_like_html(mime_type, raw):
+            return {"data": {
+                "source_artifact_id": artifact_id,
+                "source_task_id": task_id,
+                "file": None,
+                "mime_type": mime_type,
+                "bytes": len(raw),
+                "suspect_html": True,
+            }, "next": {
+                "agent_hint": "The downloaded bytes look like an HTML page, not the expected file. "
+                "The file was not written. Ask CUA to re-export the artifact instead.",
+            }}
+        path = _write_artifact(raw, args.output, mime_type)
+        result = {
+            "source_artifact_id": artifact_id,
+            "source_task_id": task_id,
+            "file": path,
+            "mime_type": mime_type,
+            "bytes": len(raw),
+            "transport": "raw",
+        }
+        return {"data": result, "next": {
+            "agent_hint": "Artifact saved to data.file from raw bytes. "
+            "Share the path with the user; do not print the bytes.",
+        }}
+
+    if data.get("missing"):
+        return {"data": {
+            "source_artifact_id": artifact_id,
+            "source_task_id": task_id,
+            "file": None,
+            "missing": True,
+            "placeholder_text": data.get("placeholder_text"),
+        }, "next": {
+            "agent_hint": "The artifact has no downloadable bytes (placeholder/missing). "
+            "Tell the user it is unavailable; do not claim a file was saved.",
+        }}
+
+    b64 = data.get("data")
+    if not b64:
+        raise SkillError("INTERNAL", "Artifact response contained no data and was not marked missing.")
+    try:
+        raw = base64.b64decode(b64, validate=True)
+    except (ValueError, TypeError) as exc:
+        raise SkillError("INTERNAL", f"Artifact was not valid base64: {exc}")
+
+    mime_type = data.get("mime_type")
+    # A surprise HTML payload usually means an error/interstitial page (e.g. a
+    # Cloudflare challenge from an external share link), not the real file.
+    if _looks_like_html(mime_type, raw):
+        return {"data": {
+            "source_artifact_id": artifact_id,
+            "source_task_id": task_id,
+            "file": None,
+            "mime_type": mime_type,
+            "bytes": len(raw),
+            "suspect_html": True,
+        }, "next": {
+            "agent_hint": "The downloaded bytes look like an HTML page, not the expected file. "
+            "The file was not written. Ask CUA to re-export the artifact instead.",
+        }}
+    path = _write_artifact(raw, args.output, mime_type)
+    result = {
+        "source_artifact_id": artifact_id,
+        "source_task_id": task_id,
+        "file": path,
+        "mime_type": mime_type,
+        "bytes": len(raw),
+        "transport": "legacy_base64",
+    }
+    return {"data": result, "next": {
+        "agent_hint": "Artifact saved to data.file. Share the path with the user; do not print the bytes.",
+    }}
+
+
+def cmd_self_test(args, state, session):
+    """Local-only checks. Does not create CUA tasks or call backends."""
+    checks = {
+        "python_version": sys.version.split()[0],
+        "python_ok": sys.version_info >= (3, 8),
+        "auth_file": str(state.path),
+        "logged_in": bool(state.access_token or os.environ.get("AP_CUA_AGENTPLAN_API_KEY")
+                          or os.environ.get("AGENTPLAN_API_KEY") or os.environ.get("ARK_API_KEY")),
+        "api_base_url": resolve_base_url(args, state) if _has_base_url(args, state) else None,
+        "last_invocation_id": session.last_invocation_id,
+    }
+    next_hint = None
+    if not checks["logged_in"]:
+        next_hint = {
+            "setup_command": login_setup_command(),
+            "agent_hint": "Not logged in yet. Do not run setup_command yourself; ask the user to run it in a local terminal before real work.",
+        }
+    return {"data": checks, "next": next_hint} if next_hint else {"data": checks}
+
+
+# -- helpers ---------------------------------------------------------------
+
+
+def _has_base_url(args, state):
+    return bool(args.api_base_url or os.environ.get("AP_CUA_SKILL_API_BASE_URL")
+                or os.environ.get("CUA_SKILL_API_BASE_URL")
+                or state.api_base_url or bundled_base_url())
+
+
+def _resolve_task_id(args, session):
+    if getattr(args, "task_id", None):
+        return args.task_id
+    if getattr(args, "last", False) and session.last_task_id:
+        return session.last_task_id
+    raise SkillError(
+        "VALIDATION_ERROR",
+        "task_id is required. Pass --task-id <id> or --last to reuse the most recent task.",
+    )
+
+
+def _resolve_context_id(args, session):
+    if getattr(args, "context_id", None):
+        return args.context_id
+    if getattr(args, "last_context", False) and session.last_context_id:
+        return session.last_context_id
+    raise SkillError(
+        "VALIDATION_ERROR",
+        "context_id is required. Pass --context-id <id> or --last-context.",
+    )
+
+
+def _task_result(action, envelope, session):
+    """Persist task/context ids from an envelope, then return data + task-flavored next."""
+    task_id = envelope.get("invocation_id")
+    platform = envelope.get("platform") or {}
+    context_id = platform.get("context_id")
+    session.set_last(
+        last_task_id=task_id,
+        last_invocation_id=task_id,
+        last_context_id=context_id,
+    )
+    return {"data": envelope, "next": _next_for_task(envelope)}
+
+
+def _next_for_task(envelope):
+    outcome = envelope.get("outcome")
+    task_id = envelope.get("invocation_id")
+    script = script_path()
+    next_action = envelope.get("next_action") or {}
+    hint = next_action.get("agent_hint", "")
+    if outcome == "in_progress":
+        return {
+            "command": f"python3 {script} task status --task-id {task_id}",
+            "agent_hint": hint or "Keep checking task status until completed, needs_input, failed, or cancelled. "
+            f"For a hands-off wait use `python3 {script} task result --task-id {task_id}`. "
+            "Do not answer the task from progress.",
+        }
+    if outcome == "needs_input":
+        return {
+            "command": f'python3 {script} task answer --task-id {task_id} --answer "<USER_ANSWER>"',
+            "agent_hint": hint or "Relay input_request.question to the user verbatim, "
+            "then submit their reply with task answer.",
+        }
+    if outcome == "completed":
+        return {"agent_hint": hint or "Use data.result.text as the authoritative final result. "
+                "Save any produced files with artifact save."}
+    if outcome == "failed":
+        return {
+            "agent_hint": hint or "CUA could not complete the task. "
+            "Explain the failure; retry only if the user asks."
+        }
+    if outcome == "cancelled":
+        return {"agent_hint": hint or "The task was cancelled."}
+    return None
+
+
+def _looks_like_html(mime_type, raw):
+    if mime_type and "html" in mime_type.lower():
+        return True
+    head = raw[:512].lstrip().lower()
+    return head.startswith(b"<!doctype html") or head.startswith(b"<html")
+
+
+def _content_type(headers):
+    value = headers.get("content-type") or headers.get("Content-Type") or ""
+    return value.split(";", 1)[0].strip() or None
+
+
+def _legacy_artifact_envelope(raw, headers):
+    content_type = _content_type(headers) or ""
+    if "json" not in content_type and not raw.lstrip().startswith(b"{"):
+        return None
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None
+    if isinstance(payload, dict) and payload.get("ok") is True and isinstance(payload.get("data"), dict):
+        return payload["data"]
+    return None
+
+
+def _write_artifact(raw, output, mime_type):
+    if output:
+        path = os.path.abspath(os.path.expanduser(output))
+        parent = os.path.dirname(path)
+        if os.path.lexists(path):
+            raise SkillError("VALIDATION_ERROR", f"Refusing to overwrite existing path: {path}")
+        if parent and not os.path.isdir(parent):
+            raise SkillError("VALIDATION_ERROR", f"Output directory does not exist: {parent}")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(raw)
+        return path
+    ext = ext_for_mime(mime_type)
+    fd, path = tempfile.mkstemp(prefix="cua-artifact-", suffix=ext)
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(raw)
+    return path
+
+
+def _resolve_invocation_id(args, session):
+    if getattr(args, "invocation_id", None):
+        return args.invocation_id
+    if getattr(args, "last", False) and session.last_invocation_id:
+        return session.last_invocation_id
+    raise SkillError(
+        "VALIDATION_ERROR",
+        "invocation_id is required. Pass --invocation-id <id> or --last to reuse the most recent invocation.",
+    )
+
+
+def _call_timeout(wait_ms):
+    """HTTP timeout must outlast the server-side wait window.
+
+    When wait_ms is None the server applies its own default wait (up to a minute
+    or so), so give a generous floor rather than timing out early.
+    """
+    if wait_ms is None:
+        return 120
+    return int(wait_ms / 1000.0) + 30
+
+
+def _wait_invocation_with_budget(state, base_url, invocation_id, wait_ms, initial_envelope=None):
+    """Wait for one invocation using a total client budget and <=60s server calls."""
+    if wait_ms is None:
+        wait_ms = DEFAULT_WATCH_WAIT_MS
+    _validate_wait_ms(wait_ms)
+    if not invocation_id:
+        raise SkillError("INTERNAL", "CUA gateway response did not include an invocation id.")
+    if initial_envelope is not None and initial_envelope.get("outcome") != "in_progress":
+        return initial_envelope
+    if wait_ms == 0:
+        if initial_envelope is not None:
+            return initial_envelope
+        return cua_auth.authorized_call(
+            state, base_url, "GET", f"/v1/invocations/{invocation_id}", retries=IDEMPOTENT_RETRIES
+        )
+
+    remaining_ms = wait_ms
+    envelope = initial_envelope
+    while remaining_ms > 0:
+        chunk_ms = min(SERVER_WAIT_CHUNK_MS, remaining_ms)
+        envelope = cua_auth.authorized_call(
+            state,
+            base_url,
+            "POST",
+            f"/v1/invocations/{invocation_id}/watch",
+            body={"wait_ms": chunk_ms},
+            timeout=_call_timeout(chunk_ms),
+            retries=IDEMPOTENT_RETRIES,
+        )
+        if envelope.get("outcome") != "in_progress":
+            return envelope
+        remaining_ms -= chunk_ms
+    return envelope
+
+
+def _validate_wait_ms(wait_ms):
+    if wait_ms is not None and wait_ms < 0:
+        raise SkillError("VALIDATION_ERROR", "--wait-ms must be >= 0")
+
+
+def _envelope_result(action, envelope, session):
+    invocation_id = envelope.get("invocation_id")
+    if invocation_id:
+        session.set_last_invocation_id(invocation_id)
+    return {"data": envelope, "next": _next_for_envelope(envelope)}
+
+
+def _next_for_envelope(envelope):
+    outcome = envelope.get("outcome")
+    invocation_id = envelope.get("invocation_id")
+    script = script_path()
+    next_action = envelope.get("next_action") or {}
+    hint = next_action.get("agent_hint", "")
+    if outcome == "in_progress":
+        return {
+            "command": f"python3 {script} watch --invocation-id {invocation_id}",
+            "agent_hint": hint or "Keep watching until completed, needs_input, failed, or cancelled. "
+            "Each watch returns quickly; just call it again while in_progress. For a hands-off wait, "
+            f"use `python3 {script} result --invocation-id {invocation_id}`. Do not answer the task from progress.",
+        }
+    if outcome == "needs_input":
+        return {
+            "command": f'python3 {script} answer --invocation-id {invocation_id} --answer "<USER_ANSWER>"',
+            "agent_hint": hint or "Relay input_request.question to the user verbatim, "
+            "then submit their reply with answer.",
+        }
+    if outcome == "completed":
+        return {"agent_hint": hint or "Use data.result.text as the authoritative final result."}
+    if outcome == "failed":
+        return {
+            "agent_hint": hint or "CUA could not complete the task. "
+            "Explain the failure; retry only if the user asks."
+        }
+    if outcome == "cancelled":
+        return {"agent_hint": hint or "The task was cancelled."}
+    return None
+
+
+# -- argument parser -------------------------------------------------------
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="cua.py", description="CUA Skill CLI")
+    parser.add_argument("--api-base-url", help="CUA gateway base URL (overrides env and cache).")
+    sub = parser.add_subparsers(dest="command")
+
+    auth = sub.add_parser("auth", help="Authentication commands").add_subparsers(dest="auth_command")
+
+    p = auth.add_parser("status", help="Check the current login state.")
+    p.set_defaults(handler=cmd_auth_status, action="auth status")
+
+    p = auth.add_parser("login", help="Configure a Volcengine Ark AgentPlan API key.")
+    p.add_argument("--api-key", help="AgentPlan API key. Prefer the local terminal prompt or AP_CUA_AGENTPLAN_API_KEY.")
+    p.add_argument("--no-prompt", action="store_true", help="Do not prompt; require --api-key or env.")
+    p.set_defaults(handler=cmd_auth_login, action="auth login")
+
+    p = auth.add_parser("logout", help="Clear the locally cached AgentPlan API key.")
+    p.set_defaults(handler=cmd_auth_logout, action="auth logout")
+
+    p = sub.add_parser("ping", help="Read-only auth and desktop-binding check. Creates no task.")
+    p.set_defaults(handler=cmd_ping, action="ping")
+
+    p = sub.add_parser("delegate", help="Delegate the user's original objective to CUA.")
+    p.add_argument(
+        "--objective", required=True,
+        help="The user's original request. Do not pre-plan or add constraints.",
+    )
+    p.add_argument("--wait-ms", type=int, default=0,
+                   help="Total ms to wait before returning. Calls are chunked at 60 seconds. "
+                        "Default 0 returns the invocation id immediately. Does not cancel the task.")
+    p.set_defaults(handler=cmd_delegate, action="delegate")
+
+    p = sub.add_parser("watch", help="Wait for or check an invocation's next state.")
+    _add_invocation_args(p)
+    p.add_argument(
+        "--wait-ms", type=int, default=DEFAULT_WATCH_WAIT_MS,
+        help="Total ms to wait before returning; server calls are chunked at 60 seconds. Does not cancel the task.",
+    )
+    p.set_defaults(handler=cmd_watch, action="watch")
+
+    p = sub.add_parser("answer", help="Submit the user's answer when outcome is needs_input.")
+    _add_invocation_args(p)
+    p.add_argument("--answer", required=True, help="The user's answer to input_request.question.")
+    p.add_argument(
+        "--wait-ms", type=int, default=DEFAULT_WATCH_WAIT_MS,
+        help="Total ms to wait before returning; calls are chunked at 60 seconds.",
+    )
+    p.set_defaults(handler=cmd_answer, action="answer")
+
+    p = sub.add_parser("cancel", help="Request cancellation. Only when the user asks to stop.")
+    _add_invocation_args(p)
+    p.set_defaults(handler=cmd_cancel, action="cancel")
+
+    p = sub.add_parser("result", help="Wait until terminal and return the authoritative result.")
+    _add_invocation_args(p)
+    p.add_argument("--timeout", type=int, default=600, help="Total seconds to keep waiting for a terminal outcome.")
+    p.set_defaults(handler=cmd_result, action="result")
+
+
+    p = sub.add_parser("self-test", help="Local-only checks. Creates no CUA task.")
+    p.set_defaults(handler=cmd_self_test, action="self-test")
+
+    _add_semantic_parsers(sub)
+
+    return parser
+
+
+def _add_semantic_parsers(sub):
+    """Resource-aware semantic command surface."""
+
+    p = sub.add_parser("diagnose", help="Confirm CUA is reachable and a desktop is bound. Creates no task.")
+    p.set_defaults(handler=cmd_diagnose, action="diagnose")
+
+    desktop = sub.add_parser("desktop", help="Cloud-desktop commands.").add_subparsers(dest="desktop_command")
+    p = desktop.add_parser("list", help="List selectable cloud desktops.")
+    p.set_defaults(handler=cmd_desktop_list, action="desktop list")
+
+
+    model = sub.add_parser("model", help="Read the default CUA model config.").add_subparsers(dest="model_command")
+    p = model.add_parser("get", help="Read the bound desktop's default model config.")
+    p.set_defaults(handler=cmd_model_get, action="model get")
+
+
+    # -- task --
+    task = sub.add_parser(
+        "task", help="Run and manage CUA tasks (semantic delegate)."
+    ).add_subparsers(dest="task_command")
+
+    p = task.add_parser("run", help="Start a new CUA task, optionally on a chosen desktop.")
+    p.add_argument(
+        "--objective", required=True,
+        help="The user's original request. Do not pre-plan or add constraints.",
+    )
+    p.add_argument("--desktop", help="Desktop id or name (from desktop list). Defaults to the bound desktop.")
+    p.add_argument("--title", help="Title for the auto-created context.")
+    p.add_argument(
+        "--wait-ms", type=int, default=0,
+        help="Total ms to wait before returning; calls are chunked at 60 seconds. Default 0.",
+    )
+    p.set_defaults(handler=cmd_task_run, action="task run")
+
+    p = task.add_parser("continue", help="Continue work in an existing context.")
+    p.add_argument("--objective", required=True, help="What to do next in this context.")
+    p.add_argument("--context-id", help="The context to continue.")
+    p.add_argument("--last-context", action="store_true", help="Use the most recent context id.")
+    p.add_argument(
+        "--wait-ms", type=int, default=0,
+        help="Total ms to wait before returning; calls are chunked at 60 seconds. Default 0.",
+    )
+    p.set_defaults(handler=cmd_task_continue, action="task continue")
+
+    p = task.add_parser("status", help="Check a task's current state.")
+    _add_task_args(p)
+    p.set_defaults(handler=cmd_task_status, action="task status")
+
+    p = task.add_parser("result", help="Wait until terminal and return the authoritative result.")
+    _add_task_args(p)
+    p.add_argument("--timeout", type=int, default=600, help="Total seconds to keep waiting for a terminal outcome.")
+    p.set_defaults(handler=cmd_task_result, action="task result")
+
+    p = task.add_parser("answer", help="Answer CUA's question when outcome is needs_input.")
+    _add_task_args(p)
+    p.add_argument("--answer", required=True, help="The user's answer to input_request.question.")
+    p.add_argument(
+        "--wait-ms", type=int, default=DEFAULT_WATCH_WAIT_MS,
+        help="Total ms to wait before returning; calls are chunked at 60 seconds.",
+    )
+    p.set_defaults(handler=cmd_task_answer, action="task answer")
+
+    p = task.add_parser("cancel", help="Cancel a task. Only when the user asks to stop.")
+    _add_task_args(p)
+    p.set_defaults(handler=cmd_task_cancel, action="task cancel")
+
+    # -- context --
+    context = sub.add_parser("context", help="Manage reusable task contexts.").add_subparsers(dest="context_command")
+
+    p = context.add_parser("list", help="List continuable contexts.")
+    p.set_defaults(handler=cmd_context_list, action="context list")
+
+    p = context.add_parser("create", help="Open a long-lived context without running a task yet.")
+    p.add_argument("--title", help="Context title.")
+    p.add_argument("--desktop", help="Desktop id or name. Defaults to the bound desktop.")
+    p.set_defaults(handler=cmd_context_create, action="context create")
+
+    p = context.add_parser("add-note", help="Add background to a context without starting a run.")
+    _add_context_args(p)
+    p.add_argument("--text", required=True, help="The background/context note to record.")
+    p.set_defaults(handler=cmd_context_add_note, action="context add-note")
+
+    p = context.add_parser("show", help="Show a context summary and recent task.")
+    _add_context_args(p)
+    p.set_defaults(handler=cmd_context_show, action="context show")
+
+    # -- timeline --
+    timeline = sub.add_parser(
+        "timeline", help="Conversation timeline commands."
+    ).add_subparsers(dest="timeline_command")
+    p = timeline.add_parser("show", help="Show the full conversation timeline projection for a context.")
+    _add_context_args(p)
+    p.set_defaults(handler=cmd_timeline_show, action="timeline show")
+
+    # -- artifact --
+    artifact = sub.add_parser("artifact", help="List and save task artifacts.").add_subparsers(dest="artifact_command")
+
+    p = artifact.add_parser("list", help="List artifacts produced by a task.")
+    _add_task_args(p)
+    p.set_defaults(handler=cmd_artifact_list, action="artifact list")
+
+    p = artifact.add_parser("save", help="Download an artifact (file, screenshot, log) to a local path.")
+    p.add_argument("--artifact-id", help="The artifact id (from artifact list / result).")
+    p.add_argument("--last", action="store_true", help="Use the most recent artifact id.")
+    p.add_argument("--task-id", help="Task id that owns the artifact. Defaults to the most recent task.")
+    p.add_argument("--output", help="Where to write the file. Defaults to a temp file named by content type.")
+    p.set_defaults(handler=cmd_artifact_save, action="artifact save")
+
+
+def _add_task_args(p):
+    p.add_argument("--task-id", help="The task id (same id space as invocation_id).")
+    p.add_argument("--last", action="store_true", help="Use the most recent task id from local session cache.")
+
+
+def _add_context_args(p):
+    p.add_argument("--context-id", help="The context id.")
+    p.add_argument("--last-context", action="store_true", help="Use the most recent context id.")
+
+
+def _add_invocation_args(p):
+    p.add_argument("--invocation-id", help="The invocation id returned by delegate.")
+    p.add_argument("--last", action="store_true", help="Use the most recent invocation id from local session cache.")
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

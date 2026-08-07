@@ -15,9 +15,7 @@ from cua_http import gateway_call, raw_request
 from cua_util import RETRYABLE_ERROR_CODES, SkillError, login_setup_command
 
 DEFAULT_LOGIN_TIMEOUT_SEC = 0
-PRIMARY_API_KEY_ENV_VARS = ("AP_CUA_AGENTPLAN_API_KEY", "AGENTPLAN_API_KEY")
-COMPAT_API_KEY_ENV_VARS = ("ARK_API_KEY",)
-API_KEY_ENV_VARS = PRIMARY_API_KEY_ENV_VARS + COMPAT_API_KEY_ENV_VARS
+API_KEY_ENV_VARS = ("AP_CUA_AGENTPLAN_API_KEY", "AGENTPLAN_API_KEY", "ARK_API_KEY")
 
 
 def ensure_access_token(state, base_url):
@@ -96,23 +94,15 @@ def _authorized_raw_call_once(state, base_url, method, path, body=None, query=No
 
 def login(state, base_url, api_key=None, prompt=True, **_unused):
     """Configure and validate an AgentPlan API key."""
-    # A generic ARK_API_KEY is commonly present for unrelated Ark workloads.
-    # Prefer an explicit AgentPlan value, and in a real terminal prefer prompting
-    # over silently validating that generic compatibility alias.
-    token = _first_non_empty(api_key, *_primary_env_api_keys())
+    token = _first_non_empty(api_key, *_env_api_keys())
     if not token and prompt:
-        if sys.stdin.isatty():
-            token = getpass.getpass("AgentPlan API key: ").strip()
-        else:
-            token = _first_non_empty(*_compat_env_api_keys())
-        if not token:
+        if not sys.stdin.isatty():
             raise SkillError(
                 "AUTH_REQUIRED",
                 "AgentPlan API key required. Open a local terminal and run setup_command; do not paste the API key into chat.",
                 setup_command=login_setup_command(),
             )
-    if not token:
-        token = _first_non_empty(*_compat_env_api_keys())
+        token = getpass.getpass("AgentPlan API key: ").strip()
     if not token:
         raise SkillError(
             "AUTH_REQUIRED",
@@ -144,7 +134,7 @@ def auth_status(state, base_url):
     """Verify the current API key against /v1/auth/me without exposing it."""
     data = authorized_call(state, base_url, "GET", "/v1/auth/me")
     user = _safe_user(data.get("user") or data.get("caller") or data)
-    if user and user != state.user and not any(_env_api_keys()):
+    if user and user != state.user and not _env_api_keys():
         state.set_api_key(
             api_base_url=base_url,
             api_key=state.access_token,
@@ -169,14 +159,7 @@ def logout(state, base_url):
 
 
 def _configured_api_key(state):
-    # Dedicated AgentPlan variables are authoritative. A validated local cache
-    # outranks the generic ARK_API_KEY compatibility alias so an unrelated Ark
-    # key cannot break CUA after login.
-    return _first_non_empty(
-        *_primary_env_api_keys(),
-        state.access_token,
-        *_compat_env_api_keys(),
-    )
+    return _first_non_empty(*_env_api_keys(), state.access_token)
 
 
 def _auth_error_with_retry(exc):
@@ -202,15 +185,7 @@ def _is_agentplan_auth_rejection(exc):
 
 
 def _env_api_keys():
-    return _primary_env_api_keys() + _compat_env_api_keys()
-
-
-def _primary_env_api_keys():
-    return [os.environ.get(name) for name in PRIMARY_API_KEY_ENV_VARS]
-
-
-def _compat_env_api_keys():
-    return [os.environ.get(name) for name in COMPAT_API_KEY_ENV_VARS]
+    return [os.environ.get(name) for name in API_KEY_ENV_VARS]
 
 
 def _first_non_empty(*values):

@@ -1,4 +1,0 @@
-interface:
-  display_name: "ARK CUA"
-  short_description: "Operate CUA through AgentPlan or ByteSSO"
-  default_prompt: "Use $ark-cua to delegate this computer-use task with the appropriate auth scheme."
