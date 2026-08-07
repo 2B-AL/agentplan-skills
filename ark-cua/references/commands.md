@@ -28,14 +28,20 @@ python3 scripts/cua.py cancel (--invocation-id <id> | --last)
 
 Call `delegate` once and follow `next.command`. Long wait budgets are split into gateway waits of at most 60 seconds. Use `cancel` only on explicit user request.
 
-## Read-only desktop and model inspection
+## Desktop inspection and CUA App access
 
 ```bash
 python3 scripts/cua.py desktop list
+python3 scripts/cua.py desktop access
+python3 scripts/cua.py desktop revoke-access (--ticket <ticket> | --access-url <url>)
 python3 scripts/cua.py model get
 ```
 
-The Skill intentionally excludes desktop access-ticket generation, reboot/reset, and persistent model modification.
+`desktop access` calls `GET /v1/desktop/access` and returns a newly issued temporary URL. Give the user `full_interface_url`, falling back to `access_url`; never reuse a URL from an earlier result. New gateways return the canonical `/desktops/<id>/cua-app/?ticket=...` route directly; legacy gateway URLs are converted without dropping the ticket. Treat URLs and tickets as secrets. Revoke a URL that may have leaked or is no longer needed.
+
+If a URL returns `runtime_capability_required`, do not edit its host or path. Revoke it, run `desktop access` once, and return the newly issued URL. If that fresh URL also fails, stop and report a Desktop Gateway/runtime configuration problem.
+
+The Skill intentionally excludes reboot/reset and persistent model modification.
 
 ## Tasks and reusable contexts
 

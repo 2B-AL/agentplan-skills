@@ -19,6 +19,7 @@ import os
 import sys
 import tempfile
 import time
+import urllib.parse
 from pathlib import Path
 
 import cua_auth
@@ -226,6 +227,36 @@ def cmd_desktop_list(args, state, session):
     base_url = resolve_base_url(args, state)
     data = cua_auth.authorized_call(state, base_url, "GET", "/v1/desktop-options", retries=IDEMPOTENT_RETRIES)
     return {"data": data}
+
+
+def cmd_desktop_access(args, state, session):
+    base_url = resolve_base_url(args, state)
+    data = cua_auth.authorized_call(
+        state, base_url, "GET", "/v1/desktop/access", timeout=120,
+        retries=IDEMPOTENT_RETRIES,
+    )
+    access_url = data.get("access_url")
+    if access_url:
+        desktop_view_url, full_interface_url = _derive_desktop_urls(access_url)
+        if desktop_view_url:
+            data["desktop_view_url"] = desktop_view_url
+        if full_interface_url:
+            data["full_interface_url"] = full_interface_url
+    return {"data": data, "next": {
+        "agent_hint": "Return this newly issued full_interface_url (or access_url when unavailable) only when the user requested the CUA App link. Never reuse a URL from an earlier command result. If opening it reports runtime_capability_required, revoke this ticket and run desktop access once for a fresh URL; do not rewrite the path.",
+    }}
+
+
+def cmd_desktop_revoke_access(args, state, session):
+    base_url = resolve_base_url(args, state)
+    body = {"ticket": args.ticket} if args.ticket else {"access_url": args.access_url}
+    data = cua_auth.authorized_call(
+        state, base_url, "POST", "/v1/desktop/access/revoke", body=body,
+        retries=IDEMPOTENT_RETRIES,
+    )
+    return {"data": data, "next": {
+        "agent_hint": "The temporary CUA App URL has been revoked. Run desktop access if the user needs a new link.",
+    }}
 
 
 def cmd_model_get(args, state, session):
@@ -713,6 +744,43 @@ def _next_for_envelope(envelope):
     return None
 
 
+def _derive_desktop_urls(access_url):
+    """Return desktop-only and full CUA App URLs without changing ticket scope."""
+    try:
+        parts = urllib.parse.urlsplit(access_url)
+    except (TypeError, ValueError):
+        return None, None
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        return None, None
+
+    path = parts.path or "/"
+    segments = path.split("/")
+    if len(segments) >= 3 and segments[1] == "desktops" and segments[2]:
+        desktop_prefix = f"/desktops/{segments[2]}"
+        scope_kind = segments[3] if len(segments) >= 4 else ""
+        if scope_kind == "cua-app":
+            return None, access_url
+        full_path = desktop_prefix + "/cua-app/"
+        return access_url, urllib.parse.urlunsplit(
+            (parts.scheme, parts.netloc, full_path, parts.query, parts.fragment)
+        )
+
+    if path == "/cua-app" or path.startswith("/cua-app/"):
+        full_path = path
+        desktop_path = path[len("/cua-app"):] or "/"
+    else:
+        desktop_path = path
+        full_path = "/cua-app" + (path if path.startswith("/") else "/" + path)
+
+    desktop_view_url = urllib.parse.urlunsplit(
+        (parts.scheme, parts.netloc, desktop_path, parts.query, parts.fragment)
+    )
+    full_interface_url = urllib.parse.urlunsplit(
+        (parts.scheme, parts.netloc, full_path, parts.query, parts.fragment)
+    )
+    return desktop_view_url, full_interface_url
+
+
 # -- argument parser -------------------------------------------------------
 
 
@@ -791,6 +859,15 @@ def _add_semantic_parsers(sub):
     desktop = sub.add_parser("desktop", help="Cloud-desktop commands.").add_subparsers(dest="desktop_command")
     p = desktop.add_parser("list", help="List selectable cloud desktops.")
     p.set_defaults(handler=cmd_desktop_list, action="desktop list")
+
+    p = desktop.add_parser("access", help="Get a temporary CUA App login URL.")
+    p.set_defaults(handler=cmd_desktop_access, action="desktop access")
+
+    p = desktop.add_parser("revoke-access", help="Revoke a temporary CUA App access ticket.")
+    group = p.add_mutually_exclusive_group(required=True)
+    group.add_argument("--ticket", help="Ticket returned by desktop access.")
+    group.add_argument("--access-url", help="CUA App URL containing the ticket query parameter.")
+    p.set_defaults(handler=cmd_desktop_revoke_access, action="desktop revoke-access")
 
 
     model = sub.add_parser("model", help="Read the default CUA model config.").add_subparsers(dest="model_command")

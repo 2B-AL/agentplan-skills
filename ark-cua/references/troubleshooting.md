@@ -8,6 +8,7 @@ Branch on `error.code`; do not parse message text when a stable code exists.
 | `FORBIDDEN` | Report missing permission. |
 | `DESKTOP_NOT_BOUND` | Report that no CUA desktop is provisioned. |
 | `ACTIVE_RUN_CONFLICT` | Stop; the new task did not start. Tell the user the desktop is busy. |
+| `runtime_capability_required` | Revoke the failed desktop ticket and run `desktop access` once for a new URL. Do not rewrite the URL. If the new URL also fails, report a Desktop Gateway/runtime configuration problem. |
 | `INVOCATION_NOT_FOUND` | Recheck the ID or use `--last`; never guess. |
 | `INVOCATION_NOT_WAITING_INPUT` | Check task status before answering. |
 | `CONTEXT_NOT_FOUND` | Use `context list` or the exact context ID. |

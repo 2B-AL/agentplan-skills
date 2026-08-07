@@ -1,6 +1,6 @@
 ---
 name: ark-cua
-description: Delegate broad computer-use tasks to ARK CUA for Volcengine AgentPlan users through an authenticated cloud desktop. Use for web browsing, authenticated website or desktop-app operation, file handling, multi-step GUI workflows, reusable task contexts, artifact download, task status, or read-only desktop and model inspection. Do not use when local reasoning or a purpose-built local/API tool can complete the request more directly.
+description: Delegate broad computer-use tasks to ARK CUA for Volcengine AgentPlan users through an authenticated cloud desktop. Use for web browsing, authenticated website or desktop-app operation, file handling, multi-step GUI workflows, reusable task contexts, artifact download, task status, temporary CUA App login URLs, or read-only desktop and model inspection. Do not use when local reasoning or a purpose-built local/API tool can complete the request more directly.
 ---
 
 # ARK CUA
@@ -39,6 +39,7 @@ If task creation returns `ACTIVE_RUN_CONFLICT`, the new request did not start. S
 ## Route special intents
 
 - Specific desktop or reusable context: use `desktop list`, `task run`, `context`, and `task continue`.
+- CUA App login URL: run `desktop access` after the requested work finishes and return that command's new `data.full_interface_url`, falling back to `data.access_url`. Never reuse a URL from an earlier result. On `runtime_capability_required`, revoke the failed ticket and run `desktop access` once for a fresh URL; never rewrite the gateway-owned path. If the fresh URL also fails, report a gateway/runtime configuration failure. Use `desktop revoke-access` if a URL may have leaked or is no longer needed.
 - Local file delivery: remove only local-delivery wording from the CUA objective, have CUA export a registered artifact, then use `artifact list` and `artifact save`.
 - Health or configuration inspection: use `ping`, `diagnose`, or `model get`; do not create a task merely to test availability.
 - Stop an active task: use `cancel` only when the user explicitly asks.
@@ -53,4 +54,5 @@ If task creation returns `ACTIVE_RUN_CONFLICT`, the new request did not start. S
 - Refuse to overwrite existing local files. Require a new output path for `artifact save`.
 - Reject HTML/interstitial responses as artifacts and do not write them to disk.
 - Do not accept base64 text or an external share link as a downloaded file; require a registered artifact.
-- Do not bypass CUA questions, modify persistent model settings, manage schedules, expose desktop access tickets, or invoke desktop reboot/reset operations.
+- Treat temporary desktop URLs and their tickets as secrets. Return a URL only when the user requests access, never log it, and revoke it when exposure is suspected.
+- Do not bypass CUA questions, modify persistent model settings, manage schedules, or invoke desktop reboot/reset operations.
