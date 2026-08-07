@@ -14,7 +14,7 @@ python3 scripts/cua.py diagnose
 python3 scripts/cua.py self-test
 ```
 
-When no key is already configured, commands first probe `arkcli`, select the first personal Agent Plan Max profile (`type=agent-plan`, `plan_tier=max`), and fetch its persisted key in memory with `arkcli profile apikey get --profile <name> --plain`. If that path is unavailable, prefer the local terminal prompt or `AP_CUA_AGENTPLAN_API_KEY`; `AGENTPLAN_API_KEY` and `ARK_API_KEY` are compatibility aliases. In a non-interactive agent-run command, `auth login` returns `AUTH_REQUIRED` with `arkcli_status`, `arkcli_hint`, and `setup_command` instead of blocking. Do not print, log, or persist an arkcli-sourced key. `ping`, `diagnose`, and `self-test` do not create a CUA task.
+When no key is already configured, commands first probe `arkcli`, select the first personal Agent Plan Max profile (`type=agent-plan`, `plan_tier=max`), and fetch its persisted key in memory with `arkcli profile apikey get --profile <name> --plain`. If that path is unavailable, prefer the local terminal prompt or `ARK_AGENTPLAN_API_KEY`. This is the only API-key environment variable the skill reads; generic or legacy variables such as `ARK_API_KEY`, `AGENTPLAN_API_KEY`, `AP_CUA_AGENTPLAN_API_KEY`, and `CUA_AGENTPLAN_API_KEY` are intentionally ignored. In a non-interactive agent-run command, `auth login` returns `AUTH_REQUIRED` with `arkcli_status`, `arkcli_hint`, and `setup_command` instead of blocking. Do not print, log, or persist an arkcli-sourced key. `ping`, `diagnose`, and `self-test` do not create a CUA task.
 
 On success, `auth status` includes `data.api_key_source`: `arkcli`,
 `environment`, or `cache`. `data.arkcli_profile` is also present for arkcli.

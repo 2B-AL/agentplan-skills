@@ -510,8 +510,7 @@ def cmd_self_test(args, state, session):
         "python_version": sys.version.split()[0],
         "python_ok": sys.version_info >= (3, 8),
         "auth_file": str(state.path),
-        "logged_in": bool(state.access_token or os.environ.get("AP_CUA_AGENTPLAN_API_KEY")
-                          or os.environ.get("AGENTPLAN_API_KEY") or os.environ.get("ARK_API_KEY")),
+        "logged_in": bool(state.access_token or os.environ.get(cua_auth.API_KEY_ENV_VAR)),
         "api_base_url": resolve_base_url(args, state) if _has_base_url(args, state) else None,
         "last_invocation_id": session.last_invocation_id,
     }
