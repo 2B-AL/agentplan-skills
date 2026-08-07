@@ -1,170 +1,56 @@
 ---
 name: ark-cua
-description: Delegate broad computer-use work to an authenticated CUA cloud desktop through either the AgentPlan or ByteSSO deployment. Use for web browsing, application operation, file handling, multi-step desktop workflows, AgentPlan contexts/artifacts/schedules, or ByteSSO multi-desktop/parallel/Credential Agent work. Use AgentPlan by default; select ByteSSO only when the user explicitly requests the ByteSSO scheme.
+description: Delegate broad computer-use tasks to ARK CUA for Volcengine AgentPlan users through an authenticated cloud desktop. Use for web browsing, authenticated website or desktop-app operation, file handling, multi-step GUI workflows, reusable task contexts, artifact download, task status, or read-only desktop and model inspection. Do not use when local reasoning or a purpose-built local/API tool can complete the request more directly.
 ---
 
 # ARK CUA
 
-Operate CUA only through the bundled CLI:
+Operate ARK CUA through the bundled Python CLI. Keep all gateway access inside the CLI and never request an AgentPlan API key in chat.
+
+## Command surface
 
 ```bash
-python3 <skill_dir>/scripts/cua.py [--auth-scheme agentplan|bytesso] <command> [options]
+python3 <skill-dir>/scripts/cua.py <command> [options]
 ```
 
-Every call emits one JSON response. Never call either deployment's HTTP API
-directly.
+Parse the single JSON object printed by each invocation:
 
-## Select the scheme
+- Success: `ok: true`, with `data` and sometimes `next`.
+- Failure: `ok: false`, with `error.code` and sometimes `next.setup_command`.
 
-- If the user explicitly says AgentPlan, pass `--auth-scheme agentplan`.
-- If the user explicitly says ByteSSO, pass `--auth-scheme bytesso`.
-- If the user does not specify a scheme, omit the flag. The CLI defaults to
-  `agentplan`.
-- Do not infer a scheme from reachable networks, cached credentials, environment
-  variables, old Skill state, or the requested command.
-- If a command is unavailable under the selected scheme, report
-  `CAPABILITY_UNAVAILABLE`. Do not silently switch schemes.
+Read [references/commands.md](references/commands.md) for non-core commands. Read [references/auth.md](references/auth.md), [references/outcomes.md](references/outcomes.md), or [references/troubleshooting.md](references/troubleshooting.md) only when the corresponding state occurs.
 
-Inspect or persist an explicit choice with:
+## Core workflow
 
-```bash
-python3 <skill_dir>/scripts/cua.py auth-scheme status
-python3 <skill_dir>/scripts/cua.py auth-scheme use bytesso
-python3 <skill_dir>/scripts/cua.py auth-scheme reset
-```
+1. Run `auth status`.
+2. On `AUTH_REQUIRED`, `TOKEN_EXPIRED`, or `REFRESH_FAILED`, relay the returned `setup_command`. Ask the user to run it in their own local terminal and enter the AgentPlan API key through the hidden prompt. Never run the interactive login from an agent session and never accept the key in chat.
+3. After the user confirms login completed, run `auth status` again.
+4. Run `delegate --objective "<user request>"` once. Preserve the user's objective without planning or decomposing it.
+5. Record `data.invocation_id`; never submit the same request again.
+6. Drive `data.outcome` until terminal:
+   - `in_progress`: run `next.command` and continue watching.
+   - `needs_input`: relay `data.input_request.question` verbatim, then submit the user's reply with `answer`.
+   - `completed`: use `data.result.text` as the authoritative result.
+   - `failed`: report the failure; retry only when requested and safe.
+   - `cancelled`: report cancellation.
 
-The new Skill stores state only below `~/.ark-agentplan/ark-cua/` by default.
-It never reads or changes either legacy Skill's state.
+If task creation returns `ACTIVE_RUN_CONFLICT`, the new request did not start. Stop, tell the user the desktop is busy, and do not retry or inspect the existing task unless the user explicitly asks.
 
-## Authenticate
+## Route special intents
 
-Run `auth status` under the selected scheme before real work.
+- Specific desktop or reusable context: use `desktop list`, `task run`, `context`, and `task continue`.
+- Local file delivery: remove only local-delivery wording from the CUA objective, have CUA export a registered artifact, then use `artifact list` and `artifact save`.
+- Health or configuration inspection: use `ping`, `diagnose`, or `model get`; do not create a task merely to test availability.
+- Stop an active task: use `cancel` only when the user explicitly asks.
 
-### AgentPlan
+## Safety and result integrity
 
-If `auth status` returns `AUTH_REQUIRED`, do not run the interactive setup
-yourself. Relay `error.setup_command` or `next.setup_command` to the user and
-ask them to run it in their own local terminal. Never ask the user to paste an
-AgentPlan API Key into chat.
-
-After the user confirms setup, run `auth status` again.
-
-### ByteSSO
-
-If auth is missing or expired, run `auth login` yourself. Show the single
-ByteSSO browser login URL returned by the command, wait for the user to complete
-login, and allow the command to cache the returned credential. Do not ask the
-user to run the command and do not expose bearer credentials.
-
-Read [agentplan-auth.md](references/agentplan-auth.md) or
-[bytesso-auth.md](references/bytesso-auth.md) when authentication needs detail.
-
-## Run a task
-
-For ordinary work:
-
-```bash
-python3 <skill_dir>/scripts/cua.py [scheme option] delegate --objective "<user request>"
-```
-
-- Preserve the user's original objective.
-- Record the returned invocation/task id.
-- Do not call `delegate` twice for the same request.
-- Drive `data.outcome`:
-  - `in_progress`: run `next.command`, `watch`, or the selected scheme's task
-    watcher.
-  - `needs_input`: relay the question verbatim, then run `answer`.
-  - `completed`: use `data.result.text` as the authoritative answer.
-  - `failed` or `cancelled`: report the terminal state and safe diagnostics.
-- Treat progress and screenshots as status only.
-- Cancel only when the user explicitly asks to stop.
-- Do not finish a delegated objective with unrelated local browser/search tools.
-
-For AgentPlan, `ACTIVE_RUN_CONFLICT` means the new task did not start. Stop and
-tell the user the desktop is busy; do not retry or probe another task unless
-the user asks.
-
-For waits longer than 60 seconds, let the CLI split the client budget into
-server-sized calls. A timeout does not by itself mean a task failed.
-
-## Use scheme-specific capabilities
-
-Common commands:
-
-```text
-auth status|login|logout
-ping
-delegate
-watch
-answer
-cancel
-observe
-self-test
-desktop(s) list|reboot|operation
-```
-
-AgentPlan additionally provides:
-
-```text
-result
-diagnose
-desktop access|revoke-access|reset
-model get|set
-task run|continue|status|result|answer|cancel
-context list|create|add-note|show
-timeline show
-artifact list|save
-schedule create-once|create-recurring|list|status|history|stop|delete
-```
-
-ByteSSO additionally provides:
-
-```text
-desktops allocate|use
-tasks list|watch
-delegate --auto
-delegate --session-id
-credentials status|setup|sync|reset
-credential-target ...  # internal; use only for al-credential-sync
-```
-
-Use one ByteSSO desktop for dependent work and different idle desktops only for
-independent parallel subtasks. Preserve every task id and collect them with
-`tasks watch`.
-
-Use AgentPlan `artifact save` for local delivery. Do not put "download to my
-local machine" into the cloud-desktop objective; create the artifact first and
-then save it locally.
-
-Use AgentPlan schedules for future or recurring work. Read scheduled results
-with `schedule history`, not live `watch`.
-
-## Security rules
-
-- Never print, log, or place credentials in chat, argv, objectives, answers, or
-  repository files.
-- Never send an AgentPlan credential to ByteSSO endpoints or a ByteSSO
-  credential to AgentPlan endpoints.
-- Treat temporary desktop URLs as secrets. Revoke AgentPlan access tickets when
-  they may have leaked or are no longer needed.
-- Keep ByteSSO Credential synchronization within the public `credentials`
-  workflow. Do not enumerate secret values, copy browser profiles, read cookies,
-  broaden exact resource names, or expose pair relay ciphertext.
-- Do not auto-migrate credentials from `~/.openclaw`.
-
-## References
-
-Read only the selected scheme's references:
-
-- AgentPlan:
-  [commands](references/agentplan-commands.md),
-  [outcomes](references/agentplan-outcomes.md),
-  [API contract](references/agentplan-api-contract.md),
-  [troubleshooting](references/agentplan-troubleshooting.md).
-- ByteSSO:
-  [commands](references/bytesso-commands.md),
-  [outcomes](references/bytesso-outcomes.md),
-  [API contract](references/bytesso-api-contract.md),
-  [troubleshooting](references/bytesso-troubleshooting.md).
-- Implementation provenance and adapter changes:
-  [sources](references/sources.md).
+- Use the bundled gateway in `assets/config.json`; allow the same per-call and environment overrides as `ap-cua-skill`.
+- Configure credentials exactly like `ap-cua-skill`: resolve `--api-key`, then `AP_CUA_AGENTPLAN_API_KEY`, `AGENTPLAN_API_KEY`, or `ARK_API_KEY`, then use the hidden local-terminal prompt when no key is otherwise available. Validate and store successful credentials in the local `0600` cache.
+- Never expose API keys, cache contents, authorization headers, user answers, or artifact bytes.
+- Never infer completion from progress text or a nonterminal state.
+- Treat `result.text` as authoritative only when `outcome == completed`.
+- Refuse to overwrite existing local files. Require a new output path for `artifact save`.
+- Reject HTML/interstitial responses as artifacts and do not write them to disk.
+- Do not accept base64 text or an external share link as a downloaded file; require a registered artifact.
+- Do not bypass CUA questions, modify persistent model settings, manage schedules, expose desktop access tickets, or invoke desktop reboot/reset operations.

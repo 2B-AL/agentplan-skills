@@ -1,10 +1,8 @@
 """Shared helpers for the AgentPlan CUA Skill CLI.
 
 Stdlib only. Provides the unified JSON output contract and a structured error
-type. The CLI NEVER prints AgentPlan API keys, desktop access tokens,
-the user's objective, the user's answers, CUA's final result text, or screenshot
-bytes onto stdout/stderr; only invocation metadata, outcome, user email, and
-login status.
+type. The CLI never prints AgentPlan API keys, authorization headers, cache
+contents, or raw artifact bytes.
 """
 
 import json
@@ -67,17 +65,20 @@ def _next_for_error(body):
         return {
             "agent_hint": "The new CUA task was not started because the cloud desktop already has an active task/run. "
             "Stop here for this user request: do not retry, do not call delegate/task run/task continue again, "
-            "and do not probe with observe/diagnose/watch --last unless the user explicitly asks to inspect or cancel "
+            "and do not probe with diagnose/watch --last unless the user explicitly asks to inspect or cancel "
             "the existing task. Tell the user to wait until the current desktop task finishes, then try again.",
         }
     setup = body.get("setup_command")
     if code in ("AUTH_REQUIRED", "REFRESH_FAILED", "TOKEN_EXPIRED") and setup:
-        return {
+        next_hint = {
             "setup_command": setup,
             "agent_hint": "Do not run setup_command yourself. Ask the user to open a local terminal, "
-            "run setup_command there, enter their AgentPlan API key in that terminal prompt, "
+            "run setup_command there, enter their AgentPlan API key through the hidden prompt, "
             "then retry the original command. Never ask the user to paste the API key into chat.",
         }
+        if body.get("environment_variables"):
+            next_hint["environment_variables"] = body["environment_variables"]
+        return next_hint
     retry = body.get("retry_command")
     if code in ("AUTH_REQUIRED", "REFRESH_FAILED") and retry:
         return {
@@ -89,13 +90,8 @@ def _next_for_error(body):
     if code == "TOKEN_EXPIRED" and retry:
         return {
             "setup_command": retry,
-            "agent_hint": "Do not run retry_command yourself. Ask the user to run it in a local terminal, then retry the original command.",
-        }
-    if code == "SCHEDULING_UNAVAILABLE":
-        return {
-            "agent_hint": "This CUA backend does not support scheduled tasks. Do NOT retry with different "
-            "arguments and do NOT fall back to any external scheduler or host automation. Tell the user "
-            "scheduling is unavailable; if they want it now, run the goal once with `task run`/`delegate`.",
+            "agent_hint": "Do not run retry_command yourself. Ask the user to run it "
+            "in a local terminal, then retry the original command.",
         }
     if code == "MODEL_TIMEOUT":
         return {
@@ -138,32 +134,8 @@ def now_epoch():
     return datetime.now(timezone.utc).timestamp()
 
 
-def iso_to_epoch(value):
-    """Parse an ISO-8601 timestamp (with optional trailing Z) to epoch seconds."""
-    if not value:
-        return 0.0
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
-    except (ValueError, AttributeError):
-        return 0.0
-
-
-def epoch_to_iso(epoch):
-    return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat()
-
-
 def script_path():
-    entrypoint = os.environ.get("ARK_CUA_ENTRYPOINT")
-    if entrypoint:
-        scheme = os.environ.get("ARK_CUA_ACTIVE_SCHEME")
-        suffix = f" --auth-scheme {scheme}" if scheme else ""
-        return os.path.abspath(entrypoint) + suffix
     return os.path.abspath(sys.argv[0]) if sys.argv and sys.argv[0] else "scripts/cua.py"
-
-
-def login_retry_command():
-    """Compatibility alias for older callers; agents should prefer setup_command."""
-    return f"python3 {script_path()} auth login"
 
 
 def login_setup_command():
@@ -208,22 +180,3 @@ def ext_for_mime(mime_type):
         if subtype.isalnum():
             return "." + subtype
     return ".bin"
-
-
-def validate_iso8601(value, field):
-    """Validate an ISO-8601 timestamp string, returning it unchanged.
-
-    Raises SkillError(VALIDATION_ERROR) on a malformed value so the agent gets a
-    clear, actionable message instead of a backend rejection.
-    """
-    if not value:
-        raise SkillError("VALIDATION_ERROR", f"{field} is required and must be an ISO-8601 timestamp.")
-    try:
-        datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except (ValueError, AttributeError):
-        raise SkillError(
-            "VALIDATION_ERROR",
-            f"{field}={value!r} is not a valid ISO-8601 timestamp "
-            "(expected e.g. 2026-06-25T20:00:00Z or 2026-06-25T20:00:00+08:00).",
-        )
-    return value
