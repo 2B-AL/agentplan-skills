@@ -22,8 +22,8 @@ Read [references/commands.md](references/commands.md) for non-core commands. Rea
 
 ## Core workflow
 
-1. Run `auth status`.
-2. On `AUTH_REQUIRED`, `TOKEN_EXPIRED`, or `REFRESH_FAILED`, relay the returned `setup_command`. Ask the user to run it in their own local terminal and enter the AgentPlan API key through the hidden prompt. Never run the interactive login from an agent session and never accept the key in chat.
+1. Run `auth status`. When no credential is configured, the CLI first probes `arkcli` and, if available, selects the first profile with `type=agent-plan` and `plan_tier=max`, then reads its key in memory. It never assumes the active arkcli profile is eligible.
+2. On `AUTH_REQUIRED`, inspect `error.arkcli_status` / `error.arkcli_hint`. Follow a recoverable arkcli hint first (for example, select or refresh its key), then retry `auth status`. If arkcli is missing or that path cannot complete, relay `setup_command` and ask the user to run it in their own local terminal; the existing hidden API-key prompt is the fallback. Never accept the key in chat. On `TOKEN_EXPIRED` or `REFRESH_FAILED`, follow the same recovery path.
 3. After the user confirms login completed, run `auth status` again.
 4. Run `delegate --objective "<user request>"` once. Preserve the user's objective without planning or decomposing it.
 5. Record `data.invocation_id`; never submit the same request again.
@@ -47,7 +47,7 @@ If task creation returns `ACTIVE_RUN_CONFLICT`, the new request did not start. S
 ## Safety and result integrity
 
 - Use the bundled gateway in `assets/config.json`; allow the same per-call and environment overrides as `ap-cua-skill`.
-- Configure credentials exactly like `ap-cua-skill`: resolve `--api-key`, then `AP_CUA_AGENTPLAN_API_KEY`, `AGENTPLAN_API_KEY`, or `ARK_API_KEY`, then use the hidden local-terminal prompt when no key is otherwise available. Validate and store successful credentials in the local `0600` cache.
+- Reuse an already configured environment or cached credential. When one is not available—or an existing credential is rejected—prefer arkcli: list profiles, require exact `type=agent-plan` plus `plan_tier=max`, and fetch the selected profile with `arkcli profile apikey get --profile <name> --plain`. Keep an arkcli-sourced key only in the current process; never print, log, or copy it into the CUA cache. If arkcli is absent or this flow fails, fall back to the hidden local-terminal prompt and its `0600` cache.
 - Never expose API keys, cache contents, authorization headers, user answers, or artifact bytes.
 - Never infer completion from progress text or a nonterminal state.
 - Treat `result.text` as authoritative only when `outcome == completed`.

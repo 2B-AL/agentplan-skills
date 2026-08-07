@@ -70,11 +70,22 @@ def _next_for_error(body):
         }
     setup = body.get("setup_command")
     if code in ("AUTH_REQUIRED", "REFRESH_FAILED", "TOKEN_EXPIRED") and setup:
+        if body.get("arkcli_status"):
+            agent_hint = (
+                "arkcli discovery already ran. Inspect error.arkcli_status and follow error.arkcli_hint first; "
+                "never expose the key. If arkcli is unavailable or cannot be repaired, ask the user to open "
+                "a local terminal, run setup_command there, and use the hidden API-key prompt. Never ask the "
+                "user to paste the API key into chat."
+            )
+        else:
+            agent_hint = (
+                "Do not run setup_command yourself. Ask the user to open a local terminal, "
+                "run setup_command there, enter their AgentPlan API key through the hidden prompt, "
+                "then retry the original command. Never ask the user to paste the API key into chat."
+            )
         next_hint = {
             "setup_command": setup,
-            "agent_hint": "Do not run setup_command yourself. Ask the user to open a local terminal, "
-            "run setup_command there, enter their AgentPlan API key through the hidden prompt, "
-            "then retry the original command. Never ask the user to paste the API key into chat.",
+            "agent_hint": agent_hint,
         }
         if body.get("environment_variables"):
             next_hint["environment_variables"] = body["environment_variables"]
