@@ -43,18 +43,56 @@ SERVER_WAIT_CHUNK_MS = 60000
 IDEMPOTENT_RETRIES = 2
 
 
+class ParserHelp(Exception):
+    """Carry argparse help text to the unified JSON success envelope."""
+
+    def __init__(self, text):
+        super().__init__(text)
+        self.text = text
+
+
+class JsonArgumentParser(argparse.ArgumentParser):
+    """Route all argparse output through the CLI's one-JSON-object contract."""
+
+    def error(self, message):
+        raise SkillError(
+            "VALIDATION_ERROR",
+            message,
+            usage=self.format_usage().strip(),
+        )
+
+    def print_help(self, file=None):
+        del file
+        raise ParserHelp(self.format_help())
+
+    def exit(self, status=0, message=None):
+        if status == 0:
+            raise ParserHelp(self.format_help())
+        raise SkillError(
+            "VALIDATION_ERROR",
+            (message or "Invalid command-line arguments.").strip(),
+            usage=self.format_usage().strip(),
+        )
+
+
 def main(argv=None):
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    action = getattr(args, "action", None)
-    if not action:
-        parser.print_help(sys.stderr)
-        return 2
+    action = "<parse>"
     try:
+        parser = build_parser()
+        args = parser.parse_args(argv)
+        action = getattr(args, "action", None) or "<parse>"
+        if action == "<parse>":
+            raise SkillError(
+                "VALIDATION_ERROR",
+                "A command and subcommand are required.",
+                usage=parser.format_usage().strip(),
+            )
         state = AuthState.load()
         session = SessionState.load()
         data = args.handler(args, state, session)
         emit_success(action, data)
+    except ParserHelp as exc:
+        emit_success("help", {"data": {"usage": exc.text}})
     except SkillError as exc:
         emit_error(action, exc)
     except BrokenPipeError:
@@ -80,9 +118,39 @@ def resolve_base_url(args, state, persist=False):
             "No CUA gateway configured. Set api_base_url in the skill's assets/config.json, "
             "pass --api-base-url, or set AP_CUA_SKILL_API_BASE_URL.",
         )
-    base_url = base_url.rstrip("/")
+    base_url = _validate_base_url(base_url)
     if persist and state.api_base_url != base_url:
         state.set_api_base_url(base_url)
+    return base_url
+
+
+def _validate_base_url(base_url):
+    """Require encrypted bearer-token transport except for loopback testing."""
+    if not isinstance(base_url, str) or not base_url.strip():
+        raise SkillError("VALIDATION_ERROR", "CUA gateway URL must be a non-empty URL.")
+    base_url = base_url.strip().rstrip("/")
+    try:
+        parts = urllib.parse.urlsplit(base_url)
+        hostname = parts.hostname
+        _ = parts.port  # Validate malformed/non-numeric ports eagerly.
+    except ValueError as exc:
+        raise SkillError("VALIDATION_ERROR", "CUA gateway URL is invalid.") from exc
+    if not hostname or parts.username is not None or parts.password is not None:
+        raise SkillError(
+            "VALIDATION_ERROR",
+            "CUA gateway URL must include a host and must not include user credentials.",
+        )
+    scheme = parts.scheme.lower()
+    is_loopback_http = scheme == "http" and hostname.lower() in {
+        "localhost",
+        "127.0.0.1",
+        "::1",
+    }
+    if scheme != "https" and not is_loopback_http:
+        raise SkillError(
+            "VALIDATION_ERROR",
+            "CUA gateway URL must use HTTPS; HTTP is allowed only for localhost, 127.0.0.1, or ::1.",
+        )
     return base_url
 
 
@@ -116,7 +184,6 @@ def cmd_auth_login(args, state, session):
     base_url = resolve_base_url(args, state, persist=True)
     return {"data": cua_auth.login(
         state, base_url,
-        api_key=args.api_key,
         prompt=not args.no_prompt,
     )}
 
@@ -510,7 +577,7 @@ def cmd_self_test(args, state, session):
         "python_version": sys.version.split()[0],
         "python_ok": sys.version_info >= (3, 8),
         "auth_file": str(state.path),
-        "logged_in": bool(state.access_token or os.environ.get(cua_auth.API_KEY_ENV_VAR)),
+        "logged_in": bool(state.access_token),
         "api_base_url": resolve_base_url(args, state) if _has_base_url(args, state) else None,
         "last_invocation_id": session.last_invocation_id,
     }
@@ -784,7 +851,7 @@ def _derive_desktop_urls(access_url):
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(prog="cua.py", description="CUA Skill CLI")
+    parser = JsonArgumentParser(prog="cua.py", description="CUA Skill CLI")
     parser.add_argument("--api-base-url", help="CUA gateway base URL (overrides env and cache).")
     sub = parser.add_subparsers(dest="command")
 
@@ -793,9 +860,8 @@ def build_parser():
     p = auth.add_parser("status", help="Check the current login state.")
     p.set_defaults(handler=cmd_auth_status, action="auth status")
 
-    p = auth.add_parser("login", help="Use arkcli or configure a Volcengine Ark AgentPlan API key.")
-    p.add_argument("--api-key", help="Fallback AgentPlan API key. Prefer arkcli or the hidden local prompt.")
-    p.add_argument("--no-prompt", action="store_true", help="Do not prompt; require arkcli, --api-key, or env.")
+    p = auth.add_parser("login", help="Use arkcli or the hidden local credential prompt.")
+    p.add_argument("--no-prompt", action="store_true", help="Do not prompt; require an arkcli credential.")
     p.set_defaults(handler=cmd_auth_login, action="auth login")
 
     p = auth.add_parser("logout", help="Clear the locally cached AgentPlan API key.")

@@ -5,6 +5,7 @@ Branch on `error.code`; do not parse message text when a stable code exists.
 | Code | Action |
 | --- | --- |
 | `AUTH_REQUIRED` / `TOKEN_EXPIRED` / `REFRESH_FAILED` | Ask the user to run `setup_command` in their local terminal, then retry after confirmation. |
+| `AUTH_REQUIRED` with `arkcli_status=state_snapshot_failed` | The Skill could not create its private arkcli state snapshot. Use the local hidden API-key prompt or repair read access to `~/.arkcli`. |
 | `FORBIDDEN` | Report missing permission. |
 | `DESKTOP_NOT_BOUND` | Report that no CUA desktop is provisioned. |
 | `ACTIVE_RUN_CONFLICT` | Stop; the new task did not start. Tell the user the desktop is busy. |
