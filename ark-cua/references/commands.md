@@ -2,22 +2,24 @@
 
 All commands: `python3 <skill_dir>/scripts/cua.py <command> [options]`.
 Global option: `--api-base-url <url>` overrides the gateway URL for one call.
+Gateway URLs must use HTTPS; plain HTTP is accepted only for loopback development
+hosts (`localhost`, `127.0.0.1`, or `::1`).
 
 ## Authentication and health
 
 ```bash
 python3 scripts/cua.py auth status
-python3 scripts/cua.py auth login [--api-key <key>] [--no-prompt]
+python3 scripts/cua.py auth login [--no-prompt]
 python3 scripts/cua.py auth logout
 python3 scripts/cua.py ping
 python3 scripts/cua.py diagnose
 python3 scripts/cua.py self-test
 ```
 
-When no key is already configured, commands first probe `arkcli`, select the first personal Agent Plan Max profile (`type=agent-plan`, `plan_tier=max`), and fetch its persisted key in memory with `arkcli profile apikey get --profile <name> --plain`. If that path is unavailable, prefer the local terminal prompt or `ARK_AGENTPLAN_API_KEY`. This is the only API-key environment variable the skill reads; generic or legacy variables such as `ARK_API_KEY`, `AGENTPLAN_API_KEY`, `AP_CUA_AGENTPLAN_API_KEY`, and `CUA_AGENTPLAN_API_KEY` are intentionally ignored. In a non-interactive agent-run command, `auth login` returns `AUTH_REQUIRED` with `arkcli_status`, `arkcli_hint`, and `setup_command` instead of blocking. Do not print, log, or persist an arkcli-sourced key. `ping`, `diagnose`, and `self-test` do not create a CUA task.
+When no protected local credential is configured, commands probe `arkcli` through a private `0700` temporary HOME snapshot, select the first personal Agent Plan Max profile (`type=agent-plan`, `plan_tier=max`), and receive a redacted credential handle from the broker. The snapshot is deleted after discovery and the real arkcli state is never modified. If that path is unavailable, use the hidden prompt from a real local terminal. In a non-interactive agent-run command, `auth login` returns `AUTH_REQUIRED` with `arkcli_status`, `arkcli_hint`, and `setup_command` instead of blocking. Credentials are never included in CLI output. `ping`, `diagnose`, and `self-test` do not create a CUA task.
 
-On success, `auth status` includes `data.api_key_source`: `arkcli`,
-`environment`, or `cache`. `data.arkcli_profile` is also present for arkcli.
+On success, `auth status` includes only the credential source (`arkcli` or
+`cache`). `data.arkcli_profile` is also present for arkcli.
 
 ## Core delegation
 

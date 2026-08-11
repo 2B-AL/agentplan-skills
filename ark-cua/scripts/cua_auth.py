@@ -7,36 +7,56 @@ stdout/stderr. The gateway validates it with Ark acquire and uses the same key
 as the model API key for CUA runtime calls.
 """
 
+import contextlib
 import getpass
+import hmac
 import json
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
+from pathlib import Path
 
 from cua_http import gateway_call, raw_request
 from cua_util import RETRYABLE_ERROR_CODES, SkillError, login_setup_command
 
 DEFAULT_LOGIN_TIMEOUT_SEC = 0
-API_KEY_ENV_VAR = "ARK_AGENTPLAN_API_KEY"
 ARKCLI_TIMEOUT_SEC = 20
+ARKCLI_SKILL_NAME = "ark-cua"
+ARKCLI_STATE_FILES = ("config.yaml", "profile.yaml", ".env")
+ARKCLI_STATE_DIRS = ("identities", "identity_store")
 
 
-def ensure_access_token(state, base_url):
-    """Return the configured AgentPlan API key."""
-    credential, discovery = _resolve_credential(state)
-    if credential:
-        return credential["token"]
-    raise _auth_required(discovery)
+class CredentialHandle:
+    """A non-serializable, redacted capability for using one credential."""
 
+    __slots__ = ("_invoke", "source", "profile")
 
-def refresh_access_token(state, base_url):
-    raise SkillError(
-        "AUTH_REQUIRED",
-        "AgentPlan API keys are not refreshed by the skill. Ask the user to run setup_command in a local terminal.",
-        setup_command=login_setup_command(),
-    )
+    def __init__(self, value, source, profile=None):
+        self._invoke = lambda operation: operation(value)
+        self.source = source
+        self.profile = profile
+
+    @classmethod
+    def optional(cls, value, source, profile=None):
+        if not isinstance(value, str) or not value.strip():
+            return None
+        return cls(value.strip(), source, profile)
+
+    def invoke(self, operation):
+        return self._invoke(operation)
+
+    def same_value(self, other):
+        if not isinstance(other, CredentialHandle):
+            return False
+        return self.invoke(
+            lambda value: other.invoke(lambda candidate: hmac.compare_digest(value, candidate))
+        )
+
+    def __repr__(self):
+        return f"CredentialHandle(source={self.source!r}, profile={self.profile!r}, value=<redacted>)"
 
 
 def authorized_call(state, base_url, method, path, body=None, query=None, timeout=None, retries=0):
@@ -95,39 +115,35 @@ def _authorized_raw_call_once(state, base_url, method, path, body=None, query=No
     return headers, raw
 
 
-def login(state, base_url, api_key=None, prompt=True, **_unused):
+def login(state, base_url, prompt=True, **_unused):
     """Configure and validate an AgentPlan API key."""
-    token = _first_non_empty(api_key, _env_api_key())
-    source = "explicit" if _first_non_empty(api_key) else ("environment" if token else None)
-    profile = None
-    arkcli_discovery = None
-    if not token:
-        credential, arkcli_discovery = _arkcli_credential()
-        if credential:
-            token = credential["token"]
-            source = credential["source"]
-            profile = credential.get("profile")
-    if not token and prompt:
+    credential, arkcli_discovery = _arkcli_credential()
+    if not credential and prompt:
         if not sys.stdin.isatty():
             raise _auth_required(arkcli_discovery)
-        token = getpass.getpass("AgentPlan API key: ").strip()
-        source = "prompt"
-    if not token:
+        credential = CredentialHandle.optional(
+            getpass.getpass("AgentPlan API key: "), "prompt"
+        )
+    if not credential:
         raise _auth_required(arkcli_discovery)
 
     try:
-        data = gateway_call("GET", base_url, "/v1/auth/me", token=token)
+        data = credential.invoke(
+            lambda value: gateway_call("GET", base_url, "/v1/auth/me", token=value)
+        )
     except SkillError as exc:
-        if source == "arkcli" and _is_agentplan_auth_rejection(exc):
+        if credential.source == "arkcli" and _is_agentplan_auth_rejection(exc):
             if not prompt or not sys.stdin.isatty():
-                raise _auth_required({"status": "api_key_rejected", "profile": profile})
-            token = getpass.getpass("AgentPlan API key (arkcli fallback): ").strip()
-            if not token:
-                raise _auth_required({"status": "api_key_rejected", "profile": profile})
-            source = "prompt"
-            profile = None
+                raise _auth_required({"status": "api_key_rejected", "profile": credential.profile})
+            credential = CredentialHandle.optional(
+                getpass.getpass("AgentPlan API key (arkcli fallback): "), "prompt"
+            )
+            if not credential:
+                raise _auth_required({"status": "api_key_rejected"})
             try:
-                data = gateway_call("GET", base_url, "/v1/auth/me", token=token)
+                data = credential.invoke(
+                    lambda value: gateway_call("GET", base_url, "/v1/auth/me", token=value)
+                )
             except SkillError as fallback_exc:
                 raise _auth_error_with_retry(fallback_exc)
         else:
@@ -135,23 +151,25 @@ def login(state, base_url, api_key=None, prompt=True, **_unused):
     user = _safe_user(data.get("user") or data.get("caller") or data)
     # arkcli remains the source of truth. Its key is used only by this process
     # and is deliberately not copied into the CUA auth cache.
-    if source != "arkcli":
-        state.set_api_key(
-            api_base_url=base_url,
-            api_key=token,
-            user=user,
-            desktop_bound=bool(data.get("desktop_bound")),
+    if credential.source != "arkcli":
+        credential.invoke(
+            lambda value: state.set_api_key(
+                api_base_url=base_url,
+                api_key=value,
+                user=user,
+                desktop_bound=bool(data.get("desktop_bound")),
+            )
         )
     result = {
         "status": "logged_in",
         "auth_type": "agentplan_api_key",
-        "credential_source": source,
+        "credential_source": credential.source,
         "user": user,
         "desktop_bound": bool(data.get("desktop_bound")),
         "scopes": _scopes(data),
     }
-    if profile:
-        result["arkcli_profile"] = profile
+    if credential.profile:
+        result["arkcli_profile"] = credential.profile
     return result
 
 
@@ -162,24 +180,26 @@ def auth_status(state, base_url):
         lambda token: gateway_call("GET", base_url, "/v1/auth/me", token=token),
     )
     user = _safe_user(data.get("user") or data.get("caller") or data)
-    if user and user != state.user and credential["source"] == "cache":
-        state.set_api_key(
-            api_base_url=base_url,
-            api_key=state.access_token,
-            user=user,
-            desktop_bound=bool(data.get("desktop_bound")),
+    if user and user != state.user and credential.source == "cache":
+        credential.invoke(
+            lambda value: state.set_api_key(
+                api_base_url=base_url,
+                api_key=value,
+                user=user,
+                desktop_bound=bool(data.get("desktop_bound")),
+            )
         )
     result = {
         "status": "logged_in",
         "auth_type": "agentplan_api_key",
-        "credential_source": credential["source"],
-        "api_key_source": credential["source"],
+        "credential_source": credential.source,
+        "api_key_source": credential.source,
         "user": user,
         "scopes": _scopes(data),
         "desktop_bound": bool(data.get("desktop_bound") or state.desktop_bound),
     }
-    if credential.get("profile"):
-        result["arkcli_profile"] = credential["profile"]
+    if credential.profile:
+        result["arkcli_profile"] = credential.profile
     return result
 
 
@@ -192,11 +212,9 @@ def logout(state, base_url):
 
 
 def _resolve_credential(state):
-    token = _first_non_empty(_env_api_key())
-    if token:
-        return {"token": token, "source": "environment"}, None
-    if state.access_token:
-        return {"token": state.access_token, "source": "cache"}, None
+    cached = CredentialHandle.optional(state.access_token, "cache")
+    if cached:
+        return cached, None
     return _arkcli_credential()
 
 
@@ -205,26 +223,26 @@ def _with_credential_recovery(state, operation):
     if not credential:
         raise _auth_required(discovery)
     try:
-        return operation(credential["token"]), credential
+        return credential.invoke(operation), credential
     except SkillError as exc:
         if _is_agentplan_auth_rejection(exc):
-            if credential["source"] == "arkcli":
-                raise _auth_required({"status": "api_key_rejected", "profile": credential.get("profile")})
+            if credential.source == "arkcli":
+                raise _auth_required({"status": "api_key_rejected", "profile": credential.profile})
             arkcli_credential, arkcli_discovery = _arkcli_credential()
-            if arkcli_credential and arkcli_credential["token"] != credential["token"]:
+            if arkcli_credential and not arkcli_credential.same_value(credential):
                 try:
-                    return operation(arkcli_credential["token"]), arkcli_credential
+                    return arkcli_credential.invoke(operation), arkcli_credential
                 except SkillError as arkcli_exc:
                     if _is_agentplan_auth_rejection(arkcli_exc):
                         raise _auth_required({
                             "status": "api_key_rejected",
-                            "profile": arkcli_credential.get("profile"),
+                            "profile": arkcli_credential.profile,
                         })
                     raise _auth_error_with_retry(arkcli_exc)
             if arkcli_credential:
                 raise _auth_required({
                     "status": "api_key_rejected",
-                    "profile": arkcli_credential.get("profile"),
+                    "profile": arkcli_credential.profile,
                 })
             if not arkcli_credential:
                 raise _auth_required(arkcli_discovery)
@@ -237,10 +255,16 @@ def _arkcli_credential():
     if not executable:
         return None, {"status": "not_installed"}
 
-    env = os.environ.copy()
-    env.setdefault("ARKCLI_CALLER_TYPE", "ai_agent")
-    env.setdefault("ARKCLI_CALLER_NAME", "unknown_agent")
-    env["ARKCLI_SKILL_NAME"] = "ark-cua"
+    # arkcli is the credential broker. Capture its output only long enough to
+    # seal it in a redacted handle; never place it in a result or log record.
+    try:
+        with _isolated_arkcli_environment() as env:
+            return _arkcli_credential_in_environment(executable, env)
+    except OSError:
+        return None, {"status": "state_snapshot_failed"}
+
+
+def _arkcli_credential_in_environment(executable, env):
     try:
         listed = subprocess.run(
             [executable, "profile", "list", "--format", "json"],
@@ -273,30 +297,56 @@ def _arkcli_credential():
         return None, {"status": "no_agent_plan_max_profile"}
     profile_name = matches[0]["name"].strip()
 
+    # Feed broker stdout directly into the redacted handle. Never assign it to
+    # a normal variable or include it in a result or log record.
     try:
-        fetched = subprocess.run(
-            [executable, "profile", "apikey", "get", "--profile", profile_name, "--plain"],
-            capture_output=True,
-            text=True,
-            timeout=ARKCLI_TIMEOUT_SEC,
-            check=False,
-            env=env,
+        credential = CredentialHandle.optional(
+            subprocess.check_output(
+                [executable, "profile", "apikey", "get", "--profile", profile_name, "--plain"],
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=ARKCLI_TIMEOUT_SEC,
+                env=env,
+            ),
+            "arkcli",
+            profile_name,
         )
     except (OSError, subprocess.SubprocessError):
         return None, {"status": "apikey_get_failed", "profile": profile_name}
-    if fetched.returncode != 0:
-        return None, {
-            "status": _arkcli_error_status(fetched.stderr, "apikey_get_failed"),
-            "profile": profile_name,
-        }
-    token = fetched.stdout.strip()
-    if not token:
+    if not credential:
         return None, {"status": "no_api_key", "profile": profile_name}
-    return {
-        "token": token,
-        "source": "arkcli",
-        "profile": profile_name,
-    }, {"status": "ready", "profile": profile_name}
+    return credential, {"status": "ready", "profile": profile_name}
+
+
+@contextlib.contextmanager
+def _isolated_arkcli_environment():
+    """Run read-only arkcli discovery without allowing writes to the real HOME."""
+    source_home = Path(os.environ.get("HOME") or Path.home())
+    source_state = source_home / ".arkcli"
+    with tempfile.TemporaryDirectory(prefix="ark-cua-arkcli-") as temp_home:
+        os.chmod(temp_home, 0o700)
+        _copy_arkcli_state(source_state, Path(temp_home) / ".arkcli")
+        env = os.environ.copy()
+        env["HOME"] = temp_home
+        env.setdefault("ARKCLI_CALLER_TYPE", "ai_agent")
+        env.setdefault("ARKCLI_CALLER_NAME", "unknown_agent")
+        env["ARKCLI_SKILL_NAME"] = ARKCLI_SKILL_NAME
+        yield env
+
+
+def _copy_arkcli_state(source, target):
+    """Copy only profile and identity state needed by arkcli read commands."""
+    if not source.is_dir():
+        return
+    target.mkdir(mode=0o700)
+    for name in ARKCLI_STATE_FILES:
+        source_file = source / name
+        if source_file.is_file():
+            shutil.copy2(source_file, target / name)
+    for name in ARKCLI_STATE_DIRS:
+        source_dir = source / name
+        if source_dir.is_dir():
+            shutil.copytree(source_dir, target / name)
 
 
 def _arkcli_error_status(stderr, fallback):
@@ -316,6 +366,7 @@ def _auth_required(discovery=None):
         "no_agent_plan_max_profile": "arkcli has no personal Agent Plan Max profile; log in or open that plan, then retry.",
         "no_api_key": "The arkcli profile has no API key; run `arkcli auth apikey` or `arkcli profile keys refresh`, then retry.",
         "api_key_rejected": "The Agent Plan Max key returned by arkcli was rejected; run `arkcli profile keys refresh` or `arkcli auth apikey`, then retry.",
+        "state_snapshot_failed": "arkcli state could not be copied into a private temporary HOME; use the local hidden API-key prompt.",
     }
     return SkillError(
         "AUTH_REQUIRED",
@@ -354,17 +405,6 @@ def _is_agentplan_auth_rejection(exc):
     return exc.extra.get("upstream_status") == 401 and (
         "agentplan apikey" in message or "unauthorized" in message
     )
-
-
-def _env_api_key():
-    return os.environ.get(API_KEY_ENV_VAR)
-
-
-def _first_non_empty(*values):
-    for value in values:
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return None
 
 
 def _scopes(data):
