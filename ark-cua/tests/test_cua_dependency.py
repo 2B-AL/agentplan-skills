@@ -14,7 +14,7 @@ sys.path.insert(0, str(SCRIPTS))
 import cua_dependency  # noqa: E402
 
 
-COMMIT = "f194661d62ccdbebec0ea0e4bee9c60459bed635"
+COMMIT = "78e1a79421333a144de911837f15e653ce534ebb"
 
 
 class CredentialDependencyTests(unittest.TestCase):

@@ -23,7 +23,7 @@ class CredentialIntegrationTests(unittest.TestCase):
         dependency = cua.bundled_config()["credential_skill"]
         self.assertEqual(dependency["adapter_protocol"], "cua-target/v1")
         self.assertEqual(dependency["repository"], "https://github.com/2B-AL/credential-skill")
-        self.assertEqual(dependency["commit"], "f194661d62ccdbebec0ea0e4bee9c60459bed635")
+        self.assertEqual(dependency["commit"], "78e1a79421333a144de911837f15e653ce534ebb")
 
     def test_parser_exposes_high_level_credentials_and_internal_adapter(self):
         parser = cua.build_parser()

@@ -4,6 +4,6 @@
   "credential_skill": {
     "adapter_protocol": "cua-target/v1",
     "repository": "https://github.com/2B-AL/credential-skill",
-    "commit": "f194661d62ccdbebec0ea0e4bee9c60459bed635"
+    "commit": "78e1a79421333a144de911837f15e653ce534ebb"
   }
 }
