@@ -1,4 +1,9 @@
 {
   "_comment": "Bundled default AgentPlan CUA Skill Gateway URL. Users can override per-call with --api-base-url or AP_CUA_SKILL_API_BASE_URL, matching ap-cua-skill.",
-  "api_base_url": "https://s4ebmnro55svp3n2okb3k.apigateway-cn-beijing.volceapi.com"
+  "api_base_url": "https://s4ebmnro55svp3n2okb3k.apigateway-cn-beijing.volceapi.com",
+  "credential_skill": {
+    "adapter_protocol": "cua-target/v1",
+    "repository": "https://github.com/2B-AL/credential-skill",
+    "commit": "f194661d62ccdbebec0ea0e4bee9c60459bed635"
+  }
 }

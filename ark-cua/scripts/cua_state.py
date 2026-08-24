@@ -12,6 +12,8 @@ import json
 import os
 import stat
 import tempfile
+import time
+import uuid
 from pathlib import Path
 
 from cua_util import SkillError
@@ -177,6 +179,116 @@ class SessionState(_JsonFile):
                 changed = True
         if changed:
             self.save()
+
+    def credential_begin_request(self, desktop_id, mode):
+        key = f"{desktop_id or 'default'}:{mode}"
+        pending = self.data.get("credential_begin_requests")
+        if not isinstance(pending, dict):
+            pending = {}
+        item = pending.get(key)
+        if isinstance(item, dict) and int(item.get("expires_at") or 0) > int(time.time()):
+            request_id = str(item.get("request_id") or "").strip()
+            if request_id:
+                return request_id
+        request_id = "cred-" + uuid.uuid4().hex
+        pending[key] = {"request_id": request_id, "expires_at": int(time.time()) + 3600}
+        self.data["credential_begin_requests"] = pending
+        self.save()
+        return request_id
+
+    def complete_credential_begin(self, desktop_id, mode, workflow_id, device_id=None):
+        key = f"{desktop_id or 'default'}:{mode}"
+        pending = self.data.get("credential_begin_requests")
+        if isinstance(pending, dict):
+            pending.pop(key, None)
+            self.data["credential_begin_requests"] = pending
+        workflows = self.data.get("credential_workflows")
+        if not isinstance(workflows, dict):
+            workflows = {}
+        workflows[workflow_id] = {
+            "desktop_id": desktop_id or "",
+            "mode": mode,
+            "updated_at": int(time.time()),
+        }
+        self.data["credential_workflows"] = workflows
+        if device_id:
+            devices = self.data.get("credential_devices")
+            if not isinstance(devices, dict):
+                devices = {}
+            devices[desktop_id or "default"] = device_id
+            self.data["credential_devices"] = devices
+        self.save()
+
+    def credential_device(self, desktop_id):
+        devices = self.data.get("credential_devices")
+        return devices.get(desktop_id or "default") if isinstance(devices, dict) else None
+
+    def credential_reset_request(self, desktop_id, device_id):
+        key = f"{desktop_id}:{device_id}"
+        resets = self.data.get("credential_reset_requests")
+        if not isinstance(resets, dict):
+            resets = {}
+        current = resets.get(key)
+        request_id = str(current.get("request_id") if isinstance(current, dict) else current or "").strip()
+        if not request_id:
+            request_id = "cred-reset-" + uuid.uuid4().hex
+            resets[key] = {"request_id": request_id, "central_revoked": False}
+            self.data["credential_reset_requests"] = resets
+            self.save()
+        return request_id
+
+    def credential_reset_central_revoked(self, desktop_id, device_id):
+        resets = self.data.get("credential_reset_requests")
+        item = resets.get(f"{desktop_id}:{device_id}") if isinstance(resets, dict) else None
+        return isinstance(item, dict) and item.get("central_revoked") is True
+
+    def mark_credential_reset_central_revoked(self, desktop_id, device_id):
+        key = f"{desktop_id}:{device_id}"
+        resets = self.data.get("credential_reset_requests")
+        if not isinstance(resets, dict):
+            resets = {}
+        item = resets.get(key)
+        if not isinstance(item, dict):
+            item = {"request_id": str(item or "cred-reset-" + uuid.uuid4().hex)}
+        item["central_revoked"] = True
+        resets[key] = item
+        self.data["credential_reset_requests"] = resets
+        self.save()
+
+    def finish_credential_reset(self, desktop_id, device_id):
+        resets = self.data.get("credential_reset_requests")
+        if isinstance(resets, dict):
+            resets.pop(f"{desktop_id}:{device_id}", None)
+            self.data["credential_reset_requests"] = resets
+        devices = self.data.get("credential_devices")
+        if isinstance(devices, dict):
+            devices.pop(desktop_id or "default", None)
+            self.data["credential_devices"] = devices
+        self.save()
+
+    def remember_credential_operation(self, operation_id, workflow_id):
+        operations = self.data.get("credential_operations")
+        if not isinstance(operations, dict):
+            operations = {}
+        operations[operation_id] = workflow_id
+        self.data["credential_operations"] = operations
+        self.save()
+
+    def workflow_for_credential_operation(self, operation_id):
+        operations = self.data.get("credential_operations")
+        return operations.get(operation_id) if isinstance(operations, dict) else None
+
+    def finish_credential_workflow(self, workflow_id):
+        workflows = self.data.get("credential_workflows")
+        if isinstance(workflows, dict):
+            workflows.pop(workflow_id, None)
+            self.data["credential_workflows"] = workflows
+        operations = self.data.get("credential_operations")
+        if isinstance(operations, dict):
+            self.data["credential_operations"] = {
+                key: value for key, value in operations.items() if value != workflow_id
+            }
+        self.save()
 
 
 def _ensure_secure_permissions(path):

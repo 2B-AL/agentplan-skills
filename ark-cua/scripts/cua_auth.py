@@ -19,7 +19,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from cua_http import gateway_call, raw_request
+from cua_http import gateway_call, gateway_private_call, gateway_tool_call, raw_request
 from cua_util import RETRYABLE_ERROR_CODES, SkillError, login_setup_command
 
 DEFAULT_LOGIN_TIMEOUT_SEC = 0
@@ -90,6 +90,37 @@ def authorized_raw_call(state, base_url, method, path, body=None, query=None, ti
                 time.sleep(min(2 * attempt, 5))
                 continue
             raise
+
+
+def authorized_tool_call(state, base_url, tool_name, arguments=None, timeout=None, retries=0):
+    """Call an existing `/skill/tools` operation with the redacted AgentPlan credential."""
+    attempt = 0
+    while True:
+        try:
+            kwargs = {"timeout": timeout} if timeout is not None else {}
+            result, _credential = _with_credential_recovery(
+                state,
+                lambda token: gateway_tool_call(
+                    base_url, token, tool_name, arguments or {}, **kwargs
+                ),
+            )
+            return result
+        except SkillError as exc:
+            if exc.code in RETRYABLE_ERROR_CODES and attempt < retries:
+                attempt += 1
+                time.sleep(min(2 * attempt, 5))
+                continue
+            raise
+
+
+def authorized_private_call(state, base_url, path, arguments=None, timeout=None):
+    """Move an encrypted pairing envelope through a fixed private relay path."""
+    kwargs = {"timeout": timeout} if timeout is not None else {}
+    result, _credential = _with_credential_recovery(
+        state,
+        lambda token: gateway_private_call(base_url, token, path, arguments or {}, **kwargs),
+    )
+    return result
 
 
 def _authorized_call_once(state, base_url, method, path, body=None, query=None, timeout=None):

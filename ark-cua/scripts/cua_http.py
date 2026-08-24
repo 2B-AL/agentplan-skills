@@ -6,7 +6,7 @@ envelope and converts errors into SkillError with the gateway error code.
 
 import json
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from cua_util import SkillError
@@ -104,6 +104,55 @@ def gateway_call(method, base_url, path, token=None, body=None, query=None, time
                 diagnostics.setdefault("request_id", payload["request_id"])
                 data["diagnostics"] = diagnostics
         return data
+    _raise_gateway_error(status, payload)
+
+
+def gateway_manifest(base_url, timeout=30):
+    """Read the AgentPlan Skill manifest without changing local or remote state."""
+    status, payload = request("GET", base_url, "/skill/manifest", timeout=timeout)
+    if 200 <= status < 300 and isinstance(payload, dict):
+        return payload
+    _raise_gateway_error(status, payload)
+
+
+def gateway_tool_call(base_url, token, tool_name, arguments=None, timeout=DEFAULT_TIMEOUT_SEC):
+    """Call an existing AgentPlan Skill tool and return its `result` object."""
+    if not isinstance(tool_name, str) or not tool_name.startswith("cua_credential_"):
+        raise SkillError("VALIDATION_ERROR", "Unsupported Credential tool name.")
+    status, payload = request(
+        "POST",
+        base_url,
+        "/skill/tools/" + quote(tool_name, safe=""),
+        token=token,
+        body=arguments or {},
+        timeout=timeout,
+    )
+    if 200 <= status < 300 and isinstance(payload, dict) and payload.get("ok") is True:
+        result = payload.get("result", {})
+        if not isinstance(result, dict):
+            raise SkillError("UPSTREAM_PROTOCOL_ERROR", "CUA Skill tool returned an invalid result envelope.")
+        return dict(result)
+    _raise_gateway_error(status, payload)
+
+
+def gateway_private_call(base_url, token, path, arguments=None, timeout=DEFAULT_TIMEOUT_SEC):
+    """Call the fixed encrypted Credential pairing relay without exposing its payload."""
+    if (
+        not isinstance(path, str)
+        or not path.startswith("/skill/credential-relay/")
+        or ".." in path
+        or "?" in path
+        or "#" in path
+    ):
+        raise SkillError("VALIDATION_ERROR", "Unsupported private CUA Skill Gateway path.")
+    status, payload = request(
+        "POST", base_url, path, token=token, body=arguments or {}, timeout=timeout
+    )
+    if 200 <= status < 300 and isinstance(payload, dict) and payload.get("ok") is True:
+        result = payload.get("result", {})
+        if not isinstance(result, dict):
+            raise SkillError("UPSTREAM_PROTOCOL_ERROR", "Credential relay returned an invalid result envelope.")
+        return result
     _raise_gateway_error(status, payload)
 
 

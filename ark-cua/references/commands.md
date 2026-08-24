@@ -78,3 +78,20 @@ python3 scripts/cua.py artifact save (--artifact-id <id> | --last) \
 ```
 
 `artifact save` never overwrites an existing path and does not create a missing parent directory. Omit `--output` to use a secure temporary file. Downloads are limited to 256 MiB; HTML/interstitial content and missing artifacts are not written.
+
+## Credential setup and sync
+
+```bash
+python3 scripts/cua.py credentials status [--desktop-id <id>]
+python3 scripts/cua.py credentials setup [--desktop-id <id>] [--skip-browser]
+python3 scripts/cua.py credentials sync browser --desktop-id <id> <site>...
+python3 scripts/cua.py credentials sync env --desktop-id <id> <name>...
+python3 scripts/cua.py credentials sync secret --desktop-id <id> <name>...
+python3 scripts/cua.py credentials sync credential-set --desktop-id <id> --type <type> --name <name>
+python3 scripts/cua.py credentials sync file --desktop-id <id> --profile <profile>
+python3 scripts/cua.py credentials reset --desktop-id <id> [--device-id <exact-id>]
+```
+
+These commands use the existing AgentPlan Skill Gateway Credential tools and lazily resolve the official, full-commit-pinned `credential-skill`. They do not create a model task. Browser sync accepts explicit signed-Policy site names only; it has no `--all` mode and performs no per-site Chrome permission mutation. See [credentials.md](credentials.md) for the trust boundary and waiting semantics.
+
+`credential-target` is an internal `cua-target/v1` adapter surface for the pinned dependency. Agents should not call it directly.

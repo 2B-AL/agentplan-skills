@@ -1,6 +1,6 @@
 ---
 name: ark-cua
-description: Delegate broad computer-use tasks to ARK CUA for Volcengine AgentPlan users through an authenticated cloud desktop. Use for web browsing, authenticated website or desktop-app operation, file handling, multi-step GUI workflows, reusable task contexts, artifact download, task status, temporary CUA App login URLs, or read-only desktop and model inspection. Do not use when local reasoning or a purpose-built local/API tool can complete the request more directly.
+description: Delegate broad computer-use tasks to ARK CUA for Volcengine AgentPlan users through an authenticated cloud desktop, and prepare or synchronize explicit browser, environment, secret, Credential Set, or managed-file credentials to a caller-owned CUA through Credential Agent. Use for web browsing, authenticated website or desktop-app operation, file handling, multi-step GUI workflows, reusable task contexts, artifact download, task status, temporary CUA App login URLs, read-only desktop/model inspection, or CUA credential setup/sync/status/reset. Do not use when local reasoning or a purpose-built local/API tool can complete the request more directly.
 ---
 
 # ARK CUA
@@ -18,7 +18,7 @@ Parse the single JSON object printed by each invocation:
 - Success: `ok: true`, with `data` and sometimes `next`.
 - Failure: `ok: false`, with `error.code` and sometimes `next.setup_command`.
 
-Read [references/commands.md](references/commands.md) for non-core commands. Read [references/auth.md](references/auth.md), [references/outcomes.md](references/outcomes.md), or [references/troubleshooting.md](references/troubleshooting.md) only when the corresponding state occurs.
+Read [references/commands.md](references/commands.md) for non-core commands. For a credential intent, read [references/credentials.md](references/credentials.md) before acting. Read [references/auth.md](references/auth.md), [references/outcomes.md](references/outcomes.md), or [references/troubleshooting.md](references/troubleshooting.md) only when the corresponding state occurs.
 
 ## Core workflow
 
@@ -42,6 +42,7 @@ If task creation returns `ACTIVE_RUN_CONFLICT`, the new request did not start. S
 - CUA App login URL: run `desktop access` after the requested work finishes and return that command's new `data.full_interface_url`, falling back to `data.access_url`. Never reuse a URL from an earlier result. On `runtime_capability_required`, revoke the failed ticket and run `desktop access` once for a fresh URL; never rewrite the gateway-owned path. If the fresh URL also fails, report a gateway/runtime configuration failure. Use `desktop revoke-access` if a URL may have leaked or is no longer needed.
 - Local file delivery: remove only local-delivery wording from the CUA objective, have CUA export a registered artifact, then use `artifact list` and `artifact save`.
 - Health or configuration inspection: use `ping`, `diagnose`, or `model get`; do not create a task merely to test availability.
+- Credential preparation, status, synchronization, or reset: use the `credentials` commands, not `delegate` or `task run`. The CLI feature-detects the existing Gateway tools first, then lazily resolves the pinned official `credential-skill`; no separate skill installation is required. Sync only the exact desktop and exact site/resource names requested by the user. Ordinary CUA work must not silently synchronize credentials.
 - Stop an active task: use `cancel` only when the user explicitly asks.
 
 ## Safety and result integrity
@@ -55,4 +56,6 @@ If task creation returns `ACTIVE_RUN_CONFLICT`, the new request did not start. S
 - Reject HTML/interstitial responses as artifacts and do not write them to disk.
 - Do not accept base64 text or an external share link as a downloaded file; require a registered artifact.
 - Treat temporary desktop URLs and their tickets as secrets. Return a URL only when the user requests access, never log it, and revoke it when exposure is suspected.
+- Keep browser capability and business authorization separate. The required `https://*/*` host capability eliminates per-site permission requests, but every browser operation must still match the Vault-signed exact HTTPS Policy and pass the exact Origin `contains()` check. Never open Options, request/remove host permissions, add `<all_urls>`/HTTP schemes, or treat a new HTTPS Policy as an install step.
+- Credential values and pairing codes must stay inside Credential Agent and the encrypted relay. Never put them in objectives, model context, CLI output, logs, files, or chat. Reset only after central revocation of the exact Device ID is confirmed.
 - Do not bypass CUA questions, modify persistent model settings, manage schedules, or invoke desktop reboot/reset operations.

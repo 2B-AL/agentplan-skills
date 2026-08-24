@@ -16,13 +16,19 @@ import argparse
 import base64
 import json
 import os
+import queue
+import stat
+import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.parse
 from pathlib import Path
 
 import cua_auth
+import cua_dependency
+from cua_http import gateway_manifest
 from cua_state import AuthState, SessionState
 from cua_util import (
     RETRYABLE_ERROR_CODES,
@@ -41,6 +47,83 @@ DEFAULT_WATCH_WAIT_MS = 20000
 RESULT_POLL_WAIT_MS = 20000
 SERVER_WAIT_CHUNK_MS = 60000
 IDEMPOTENT_RETRIES = 2
+CREDENTIAL_TARGET_PROTOCOL = "cua-target/v1"
+CREDENTIAL_PAIR_POLL_INTERVAL_SEC = 0.5
+CREDENTIAL_GATEWAY_TOOLS = {
+    "cua_credential_capabilities",
+    "cua_credential_begin",
+    "cua_credential_health",
+    "cua_credential_browser_authorize_begin",
+    "cua_credential_browser_authorize_watch",
+    "cua_credential_browser_network_ensure",
+    "cua_credential_finish",
+    "cua_credential_reset",
+}
+CREDENTIAL_DEVICE_FEATURES = {"initialize", "pair-relay-v1", "health-v1"}
+CREDENTIAL_BROWSER_FEATURES = CREDENTIAL_DEVICE_FEATURES | {
+    "browser-unpacked-ensure",
+    "browser-authorize-v1",
+    "browser-network-ensure-v1",
+}
+
+
+def emit_target_success(action, data):
+    payload = {
+        "schema_version": 1,
+        "adapter_protocol": CREDENTIAL_TARGET_PROTOCOL,
+        "ok": True,
+        "action": action,
+        "data": data,
+    }
+    sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+    raise SystemExit(0)
+
+
+def emit_target_error(action, error):
+    code = _target_error_code(getattr(error, "code", "TARGET_AGENT_UNAVAILABLE"))
+    payload = {
+        "schema_version": 1,
+        "adapter_protocol": CREDENTIAL_TARGET_PROTOCOL,
+        "ok": False,
+        "action": action,
+        "error": {
+            "code": code,
+            "message": getattr(error, "message", "Credential target operation failed."),
+            "retryable": code in {
+                "TARGET_BUSY", "TARGET_AGENT_UNAVAILABLE", "OPERATION_IN_PROGRESS", "NETWORK_AMBIGUOUS"
+            },
+        },
+    }
+    sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+    raise SystemExit(1)
+
+
+def _target_error_code(code):
+    value = str(code or "").strip()
+    direct = {
+        "TARGET_NOT_FOUND", "TARGET_NOT_AUTHORIZED", "TARGET_BUSY",
+        "TARGET_AGENT_UNAVAILABLE", "PAIR_RELAY_EXPIRED", "PAIR_RELAY_CLOCK_SKEW",
+        "PAIR_RELAY_TARGET_MISMATCH", "BROWSER_SETUP_REQUIRED",
+        "BROWSER_PERMISSION_REQUIRED", "BROWSER_NETWORK_UNREACHABLE",
+        "OPERATION_IN_PROGRESS", "WORKFLOW_EXPIRED", "NETWORK_AMBIGUOUS",
+    }
+    if value in direct:
+        return value
+    mapping = {
+        "AUTH_REQUIRED": "TARGET_NOT_AUTHORIZED",
+        "FORBIDDEN": "TARGET_NOT_AUTHORIZED",
+        "DESKTOP_NOT_BOUND": "TARGET_NOT_FOUND",
+        "INVOCATION_NOT_FOUND": "WORKFLOW_EXPIRED",
+        "CONFLICT": "TARGET_BUSY",
+        "DESKTOP_BUSY": "TARGET_BUSY",
+        "ACTIVE_RUN_CONFLICT": "TARGET_BUSY",
+        "GATEWAY_TIMEOUT": "NETWORK_AMBIGUOUS",
+        "UPSTREAM_TIMEOUT": "NETWORK_AMBIGUOUS",
+        "NETWORK": "NETWORK_AMBIGUOUS",
+    }
+    return mapping.get(value, "TARGET_AGENT_UNAVAILABLE")
 
 
 class ParserHelp(Exception):
@@ -94,6 +177,8 @@ def main(argv=None):
     except ParserHelp as exc:
         emit_success("help", {"data": {"usage": exc.text}})
     except SkillError as exc:
+        if action.startswith("credential-target "):
+            emit_target_error(action[len("credential-target "):], exc)
         emit_error(action, exc)
     except BrokenPipeError:
         raise
@@ -156,20 +241,26 @@ def _validate_base_url(base_url):
 
 def bundled_base_url():
     """Gateway URL shipped as a bundled asset (publisher-set, once)."""
-    try:
-        cfg_path = Path(__file__).resolve().parent.parent / "assets" / "config.json"
-        if not cfg_path.exists():
-            return None
-        data = json.loads(cfg_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    url = data.get("api_base_url") if isinstance(data, dict) else None
+    data = bundled_config()
+    url = data.get("api_base_url")
     if not isinstance(url, str):
         return None
     url = url.strip()
     if not url or url.startswith("<") or "REPLACE" in url or "example.com" in url:
         return None
     return url
+
+
+def bundled_config():
+    """Read the publisher-controlled, non-secret bundled configuration."""
+    try:
+        cfg_path = Path(__file__).resolve().parent.parent / "assets" / "config.json"
+        if not cfg_path.exists():
+            return {}
+        data = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 # -- auth commands ---------------------------------------------------------
@@ -580,6 +671,7 @@ def cmd_self_test(args, state, session):
         "logged_in": bool(state.access_token),
         "api_base_url": resolve_base_url(args, state) if _has_base_url(args, state) else None,
         "last_invocation_id": session.last_invocation_id,
+        "credential_dependency": cua_dependency.configuration(_dependency_config()),
     }
     next_hint = None
     if not checks["logged_in"]:
@@ -588,6 +680,640 @@ def cmd_self_test(args, state, session):
             "agent_hint": "Not logged in yet. Do not run setup_command yourself; ask the user to run it in a local terminal before real work.",
         }
     return {"data": checks, "next": next_hint} if next_hint else {"data": checks}
+
+
+# -- Credential Skill integration -----------------------------------------
+
+
+def _credential_tool(args, state, name, payload, *, timeout=120):
+    base_url = resolve_base_url(args, state)
+    return cua_auth.authorized_tool_call(
+        state, base_url, name, payload, timeout=timeout
+    )
+
+
+def _credential_gateway_preflight(args, state, *, browser=False, reset=False):
+    base_url = resolve_base_url(args, state)
+    manifest = gateway_manifest(base_url, timeout=30)
+    capabilities = manifest.get("capabilities") if isinstance(manifest.get("capabilities"), dict) else {}
+    tools = {
+        str(tool.get("name") or "").strip()
+        for tool in (manifest.get("tools") or [])
+        if isinstance(tool, dict) and tool.get("enabled") is True
+    }
+    missing_tools = sorted(CREDENTIAL_GATEWAY_TOOLS - tools)
+    if capabilities.get("credentials") is not True or missing_tools:
+        raise SkillError(
+            "TARGET_CAPABILITY_UNAVAILABLE",
+            "Credential tools are not enabled on this AgentPlan Skill Gateway.",
+            missing_tools=missing_tools,
+        )
+    payload = {"desktop_id": args.desktop_id} if getattr(args, "desktop_id", None) else {}
+    target = _credential_tool(args, state, "cua_credential_capabilities", payload, timeout=30)
+    if target.get("adapter_protocol") != CREDENTIAL_TARGET_PROTOCOL or target.get("transport") != "access_hub_gateway":
+        raise SkillError("TARGET_CAPABILITY_UNAVAILABLE", "Gateway does not advertise the production CUA Target Adapter v1.")
+    required = {"reset-e2e-v1"} if reset else (CREDENTIAL_BROWSER_FEATURES if browser else CREDENTIAL_DEVICE_FEATURES)
+    missing_features = sorted(required - set(target.get("features") or []))
+    if missing_features:
+        raise SkillError(
+            "TARGET_CAPABILITY_UNAVAILABLE",
+            "Production CUA target is missing required Credential features.",
+            missing_features=missing_features,
+        )
+    return target
+
+
+def _safe_agent_path(value):
+    path = Path(str(value or "")).expanduser()
+    if not path.is_absolute():
+        raise SkillError("TARGET_AGENT_UNAVAILABLE", "Pass an absolute --agent-path for the signed local credential-agent.")
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise SkillError("TARGET_AGENT_UNAVAILABLE", "The local credential-agent path does not exist.") from exc
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or info.st_mode & 0o022
+        or not os.access(path, os.X_OK)
+    ):
+        raise SkillError(
+            "TARGET_AGENT_UNAVAILABLE",
+            "The local credential-agent must be an executable non-symlink file not writable by group or others.",
+        )
+    return path
+
+
+def _relay_process(agent_path, desktop_name):
+    process = subprocess.Popen(
+        [
+            str(agent_path), "pair", "--approve", "--relay-stdin",
+            "--expected-device-name", desktop_name,
+            "--expected-device-type", "cloud_desktop",
+            "--output", "jsonl",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        bufsize=1,
+    )
+    events = queue.Queue()
+
+    def reader():
+        assert process.stdout is not None
+        for line in process.stdout:
+            events.put(line)
+        events.put(None)
+
+    threading.Thread(target=reader, daemon=True).start()
+    return process, events
+
+
+def _relay_event(events, timeout_seconds):
+    try:
+        line = events.get(timeout=timeout_seconds)
+    except queue.Empty as exc:
+        raise SkillError("TARGET_AGENT_UNAVAILABLE", "Local credential-agent did not initialize pair relay in time.") from exc
+    if line is None:
+        raise SkillError("TARGET_AGENT_UNAVAILABLE", "Local credential-agent exited before pair relay was ready.")
+    try:
+        value = json.loads(line)
+    except json.JSONDecodeError as exc:
+        raise SkillError("TARGET_AGENT_UNAVAILABLE", "Local credential-agent returned invalid relay output.") from exc
+    if not isinstance(value, dict):
+        raise SkillError("TARGET_AGENT_UNAVAILABLE", "Local credential-agent returned invalid relay output.")
+    return value
+
+
+def _finish_local_relay(process, events, deadline):
+    result = None
+    while result is None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise SkillError("TARGET_AGENT_UNAVAILABLE", "Local credential-agent approval timed out.")
+        event = _relay_event(events, remaining)
+        if event.get("type") == "result":
+            result = event
+    remaining = max(0.1, deadline - time.monotonic())
+    try:
+        return_code = process.wait(timeout=remaining)
+    except subprocess.TimeoutExpired as exc:
+        process.kill()
+        process.wait()
+        raise SkillError("TARGET_AGENT_UNAVAILABLE", "Local credential-agent did not exit after approval.") from exc
+    if return_code != 0 or result.get("status") != "succeeded":
+        error = result.get("error") if isinstance(result.get("error"), dict) else {}
+        reported = str(error.get("code") or "")
+        allowed = {"PAIR_RELAY_EXPIRED", "PAIR_RELAY_CLOCK_SKEW", "PAIR_RELAY_TARGET_MISMATCH"}
+        raise SkillError(
+            reported if reported in allowed else "TARGET_AGENT_UNAVAILABLE",
+            "Local credential-agent did not approve the exact CUA pairing request.",
+        )
+    device = (result.get("details") or {}).get("device")
+    return str(device.get("id") or "").strip() if isinstance(device, dict) else ""
+
+
+def _credential_begin_once(args, state, request_id):
+    payload = {"mode": args.mode, "request_id": request_id}
+    if args.desktop_id:
+        payload["desktop_id"] = args.desktop_id
+    return _credential_tool(
+        args, state, "cua_credential_begin", payload,
+        timeout=max(30, min(180, args.timeout_seconds)),
+    )
+
+
+def cmd_credential_target_capabilities(args, state, session):
+    del session
+    payload = {"desktop_id": args.desktop_id} if args.desktop_id else {}
+    data = _credential_tool(args, state, "cua_credential_capabilities", payload, timeout=30)
+    if data.get("adapter_protocol") != CREDENTIAL_TARGET_PROTOCOL:
+        raise SkillError("TARGET_AGENT_UNAVAILABLE", "Gateway does not advertise CUA Target Adapter v1.")
+    desktop = data.get("desktop") if isinstance(data.get("desktop"), dict) else {}
+    emit_target_success("capabilities", {
+        "transport": "access_hub_gateway",
+        "desktop": {
+            "id": desktop.get("id"),
+            "name": desktop.get("name"),
+            "type": "cloud_desktop",
+            "state": desktop.get("state"),
+        },
+        "features": list(data.get("features") or []),
+    })
+
+
+def cmd_credential_target_begin(args, state, session):
+    if args.timeout_seconds < 1:
+        raise SkillError("TARGET_AGENT_UNAVAILABLE", "--timeout-seconds must be positive.")
+    agent_path = _safe_agent_path(args.agent_path)
+    deadline = time.monotonic() + args.timeout_seconds
+    request_id = session.credential_begin_request(args.desktop_id, args.mode)
+    process = None
+    data = _credential_begin_once(args, state, request_id)
+    workflow_id = str(data.get("workflow_id") or "").strip()
+    if not workflow_id:
+        raise SkillError("TARGET_AGENT_UNAVAILABLE", "Gateway did not return an opaque Credential workflow.")
+    try:
+        while data.get("status") == "preparing":
+            if time.monotonic() >= deadline:
+                raise SkillError("OPERATION_IN_PROGRESS", "Target Agent initialization is still in progress.")
+            time.sleep(min(CREDENTIAL_PAIR_POLL_INTERVAL_SEC, deadline - time.monotonic()))
+            data = _credential_begin_once(args, state, request_id)
+
+        if data.get("status") in {"pair_relay_required", "pair_pending"} and data.get("device_ready") is not True:
+            desktop_name = str(data.get("desktop_name") or "").strip()
+            if not desktop_name:
+                raise SkillError("TARGET_AGENT_UNAVAILABLE", "Gateway did not return the bound target desktop name.")
+            process, events = _relay_process(agent_path, desktop_name)
+            ready = _relay_event(events, min(15, max(1, deadline - time.monotonic())))
+            relay_public_key = str(ready.get("relay_public_key") or "").strip()
+            if ready.get("type") != "pair_relay_ready" or not relay_public_key:
+                raise SkillError("TARGET_AGENT_UNAVAILABLE", "Local credential-agent returned invalid relay readiness.")
+            base_url = resolve_base_url(args, state)
+            begun = cua_auth.authorized_private_call(
+                state,
+                base_url,
+                f"/skill/credential-relay/{urllib.parse.quote(workflow_id, safe='')}/begin",
+                {"relay_public_key": relay_public_key},
+                timeout=min(60, max(1, int(deadline - time.monotonic()))),
+            )
+            operation_id = str(begun.get("operation_id") or "").strip()
+            envelope = begun.get("pairing_envelope")
+            if not operation_id or not isinstance(envelope, dict) or "pairing_code" in begun:
+                raise SkillError("TARGET_AGENT_UNAVAILABLE", "Gateway returned an invalid encrypted pair relay response.")
+            assert process.stdin is not None
+            process.stdin.write(json.dumps(envelope, separators=(",", ":")) + "\n")
+            process.stdin.close()
+            process.stdin = None
+            approved_device_id = _finish_local_relay(process, events, deadline)
+            process = None
+            completed = cua_auth.authorized_private_call(
+                state,
+                base_url,
+                f"/skill/credential-relay/{urllib.parse.quote(workflow_id, safe='')}/complete",
+                {"operation_id": operation_id},
+                timeout=min(180, max(1, int(deadline - time.monotonic()))),
+            )
+            device_id = str(completed.get("device_id") or "").strip()
+            if not approved_device_id or not device_id or approved_device_id != device_id:
+                raise SkillError("PAIR_RELAY_TARGET_MISMATCH", "Target enrollment did not match the approved CUA device.")
+            data = completed
+
+        while True:
+            device_ready = data.get("device_ready") is True
+            browser_connected = data.get("browser_connected") is True
+            extension_ready = data.get("browser_extension_ready") is True
+            if device_ready and (args.mode == "device" or browser_connected and extension_ready):
+                break
+            if time.monotonic() >= deadline:
+                code = "BROWSER_SETUP_REQUIRED" if device_ready else "OPERATION_IN_PROGRESS"
+                raise SkillError(code, "Credential target preparation did not finish within the bounded wait.")
+            time.sleep(min(CREDENTIAL_PAIR_POLL_INTERVAL_SEC, deadline - time.monotonic()))
+            data = _credential_begin_once(args, state, request_id)
+
+        device_id = str(data.get("device_id") or "").strip()
+        if not device_id:
+            raise SkillError("TARGET_AGENT_UNAVAILABLE", "Gateway did not return the exact enrolled Device ID.")
+        session.complete_credential_begin(args.desktop_id, args.mode, workflow_id, device_id)
+        emit_target_success("begin", {
+            "workflow_id": workflow_id,
+            "desktop_id": data.get("desktop_id"),
+            "device_id": device_id,
+            "device_ready": True,
+            "browser_extension_ready": data.get("browser_extension_ready") is True,
+            "browser_connected": data.get("browser_connected") is True,
+            "expires_at": data.get("expires_at"),
+        })
+    finally:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait()
+
+
+def cmd_credential_target_health(args, state, session):
+    del session
+    data = _credential_tool(args, state, "cua_credential_health", {"workflow_id": args.workflow_id}, timeout=args.timeout_seconds)
+    emit_target_success("health", {
+        "healthy": data.get("healthy") is True,
+        "device_ready": data.get("device_ready") is True,
+        "browser_ready": data.get("browser_ready") is True,
+        "warning_count": int(data.get("warning_count") or 0),
+        "issue_count": int(data.get("issue_count") or 0),
+    })
+
+
+def cmd_credential_target_authorize_begin(args, state, session):
+    data = _credential_tool(args, state, "cua_credential_browser_authorize_begin", {
+        "workflow_id": args.workflow_id, "sites": args.site,
+    }, timeout=args.timeout_seconds)
+    operation_id = str(data.get("operation_id") or "").strip()
+    if not operation_id:
+        raise SkillError("TARGET_AGENT_UNAVAILABLE", "Gateway did not return an HTTPS capability observation.")
+    session.remember_credential_operation(operation_id, args.workflow_id)
+    emit_target_success("browser-authorize-begin", {
+        "operation_id": operation_id,
+        "status": data.get("status") or "running",
+        "sites": list(data.get("sites") or args.site),
+    })
+
+
+def cmd_credential_target_authorize_watch(args, state, session):
+    workflow_id = session.workflow_for_credential_operation(args.operation_id)
+    if not workflow_id:
+        raise SkillError("WORKFLOW_EXPIRED", "HTTPS capability observation is not bound to an active local workflow.")
+    deadline = time.monotonic() + args.timeout_seconds
+    while True:
+        remaining = max(1, int(deadline - time.monotonic()) + 1)
+        data = _credential_tool(args, state, "cua_credential_browser_authorize_watch", {
+            "workflow_id": workflow_id, "operation_id": args.operation_id,
+        }, timeout=min(30, remaining))
+        status = str(data.get("status") or "running").lower()
+        if status in {"succeeded", "completed", "authorized"}:
+            emit_target_success("browser-authorize-watch", {
+                "operation_id": args.operation_id, "status": "succeeded", "authorized": True,
+            })
+        if status in {"failed", "error", "cancelled", "canceled"}:
+            raise SkillError("BROWSER_PERMISSION_REQUIRED", "Chrome is withholding the required HTTPS capability.")
+        if time.monotonic() >= deadline:
+            raise SkillError("OPERATION_IN_PROGRESS", "HTTPS capability observation is still in progress.")
+        time.sleep(min(args.poll_interval_ms / 1000, deadline - time.monotonic()))
+
+
+def cmd_credential_target_network_ensure(args, state, session):
+    del session
+    data = _credential_tool(args, state, "cua_credential_browser_network_ensure", {
+        "workflow_id": args.workflow_id, "sites": args.site,
+    }, timeout=args.timeout_seconds)
+    emit_target_success("browser-network-ensure", {
+        "status": data.get("status") or "unknown",
+        "mode": data.get("mode") or "direct",
+        "fallback_configured": data.get("fallback_configured") is True,
+        "proxy_applied": data.get("proxy_applied") is True,
+    })
+
+
+def cmd_credential_target_finish(args, state, session):
+    data = _credential_tool(args, state, "cua_credential_finish", {"workflow_id": args.workflow_id}, timeout=args.timeout_seconds)
+    session.finish_credential_workflow(args.workflow_id)
+    emit_target_success("finish", {
+        "workflow_id": args.workflow_id,
+        "finished": data.get("finished") is True,
+        "already_finished": data.get("already_finished") is True,
+    })
+
+
+def cmd_credential_target_reset(args, state, session):
+    request_id = session.credential_reset_request(args.desktop_id, args.device_id)
+    data = _credential_tool(args, state, "cua_credential_reset", {
+        "desktop_id": args.desktop_id,
+        "device_id": args.device_id,
+        "request_id": request_id,
+    }, timeout=args.timeout_seconds)
+    if data.get("pair_ready") is True:
+        session.finish_credential_reset(args.desktop_id, args.device_id)
+    emit_target_success("reset", {
+        "desktop_id": data.get("desktop_id") or args.desktop_id,
+        "device_id": data.get("device_id") or args.device_id,
+        "pair_ready": data.get("pair_ready") is True,
+    })
+
+
+def _credential_agent_default():
+    configured = os.environ.get("AL_CREDENTIAL_AGENT_PATH")
+    if configured:
+        return Path(configured).expanduser()
+    if sys.platform == "win32":
+        return Path.home() / "AppData" / "Local" / "AL" / "CredentialAgent" / "credential-agent.exe"
+    return Path.home() / ".local" / "bin" / "credential-agent"
+
+
+def _dependency_config():
+    config = bundled_config()
+    dependency = config.get("credential_skill")
+    if isinstance(dependency, dict):
+        merged = dict(dependency)
+        for key in ("credential_skill_dir", "credential_skill_repository", "credential_skill_commit"):
+            if config.get(key) and key not in merged:
+                merged[key] = config[key]
+        return merged
+    return config
+
+
+def _credential_subprocess_env(args):
+    environment = os.environ.copy()
+    if getattr(args, "api_base_url", None):
+        environment["AP_CUA_SKILL_API_BASE_URL"] = _validate_base_url(args.api_base_url)
+    return environment
+
+
+def _run_credential_script(command, timeout_seconds, *, environment=None):
+    try:
+        completed = subprocess.run(
+            command,
+            stdin=None,
+            stdout=subprocess.PIPE,
+            stderr=None,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+            env=environment,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise SkillError("UPSTREAM_TIMEOUT", "Credential workflow exceeded its bounded client wait.") from exc
+    lines = [line for line in completed.stdout.splitlines() if line.strip()]
+    result = None
+    for line in reversed(lines):
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and value.get("type") == "result":
+            result = value
+            break
+        if isinstance(value, dict) and "status" in value and result is None:
+            result = value
+    if completed.returncode or not isinstance(result, dict) or result.get("status") != "succeeded":
+        error = result.get("error") if isinstance(result, dict) and isinstance(result.get("error"), dict) else {}
+        raise SkillError(
+            str(error.get("code") or "UPSTREAM_FAILURE"),
+            str(error.get("message") or "Credential workflow did not succeed."),
+            job_id=(result.get("details") or {}).get("job_id") if isinstance(result, dict) else None,
+        )
+    return result
+
+
+def _run_local_target(args, command, timeout_seconds):
+    invocation = [sys.executable, str(Path(__file__).resolve())]
+    if getattr(args, "api_base_url", None):
+        invocation.extend(["--api-base-url", args.api_base_url])
+    invocation.extend(["credential-target", *command])
+    try:
+        completed = subprocess.run(
+            invocation,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise SkillError("UPSTREAM_TIMEOUT", "Credential target operation exceeded its bounded client wait.") from exc
+    lines = [line for line in completed.stdout.splitlines() if line.strip()]
+    try:
+        envelope = json.loads(lines[-1]) if lines else {}
+    except json.JSONDecodeError as exc:
+        raise SkillError("UPSTREAM_PROTOCOL_ERROR", "Credential target returned invalid structured output.") from exc
+    if (
+        completed.returncode
+        or not isinstance(envelope, dict)
+        or envelope.get("adapter_protocol") != CREDENTIAL_TARGET_PROTOCOL
+        or envelope.get("ok") is not True
+    ):
+        error = envelope.get("error") if isinstance(envelope, dict) and isinstance(envelope.get("error"), dict) else {}
+        raise SkillError(
+            str(error.get("code") or "UPSTREAM_FAILURE"),
+            str(error.get("message") or "Credential target operation did not succeed."),
+        )
+    data = envelope.get("data")
+    if not isinstance(data, dict):
+        raise SkillError("UPSTREAM_PROTOCOL_ERROR", "Credential target returned an invalid result envelope.")
+    return data
+
+
+def cmd_credentials_status(args, state, session):
+    del session
+    target = _credential_gateway_preflight(args, state)
+    dependency = cua_dependency.status(_dependency_config())
+    agent_path = _credential_agent_default()
+    agent = {"installed": False, "path": str(agent_path)}
+    try:
+        checked = _safe_agent_path(agent_path)
+        completed = subprocess.run(
+            [str(checked), "capabilities", "--output", "json"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        capabilities = json.loads(completed.stdout) if completed.returncode == 0 else {}
+        enrollment = capabilities.get("enrollment") if isinstance(capabilities.get("enrollment"), dict) else {}
+        browser = capabilities.get("browser") if isinstance(capabilities.get("browser"), dict) else {}
+        agent = {
+            "installed": True,
+            "path": str(checked),
+            "enrollment_valid": enrollment.get("valid") is True,
+            "browser_connected": browser.get("connected") is True,
+        }
+    except (SkillError, ValueError, subprocess.TimeoutExpired):
+        pass
+    return {"data": {"dependency": dependency, "source_agent": agent, "target": target}}
+
+
+def cmd_credentials_setup(args, state, session):
+    del session
+    _credential_gateway_preflight(args, state, browser=not args.skip_browser)
+    runtime = cua_dependency.ensure(_dependency_config())
+    command = [
+        sys.executable, str(runtime / "scripts" / "prepare-source.py"),
+        "--timeout-seconds", str(args.timeout_seconds),
+    ]
+    if args.agent_path:
+        command.extend(["--agent-path", args.agent_path])
+    if args.skip_browser:
+        command.append("--skip-browser")
+    environment = _credential_subprocess_env(args)
+    result = _run_credential_script(command, args.timeout_seconds + 15, environment=environment)
+    agent = _safe_agent_path(result.get("agent_path"))
+    mode = "device" if args.skip_browser else "browser"
+    begin = [
+        "begin", "--mode", mode, "--agent-path", str(agent),
+        "--timeout-seconds", str(args.timeout_seconds),
+    ]
+    if args.desktop_id:
+        begin.extend(["--desktop-id", args.desktop_id])
+    target = _run_local_target(args, begin, args.timeout_seconds + 15)
+    workflow_id = str(target.get("workflow_id") or "").strip()
+    if not workflow_id or target.get("device_ready") is not True:
+        raise SkillError("UPSTREAM_PROTOCOL_ERROR", "Credential target setup did not return an exact ready workflow.")
+    setup_error = None
+    try:
+        browser_ready = target.get("browser_extension_ready") is True and target.get("browser_connected") is True
+        if not args.skip_browser and not browser_ready:
+            raise SkillError("BROWSER_SETUP_REQUIRED", "Credential target browser did not become ready.")
+    except Exception as exc:
+        setup_error = exc
+        raise
+    finally:
+        try:
+            _run_local_target(args, [
+                "finish", "--workflow-id", workflow_id,
+                "--timeout-seconds", str(min(args.timeout_seconds, 60)),
+            ], min(args.timeout_seconds, 60) + 10)
+        except SkillError:
+            if setup_error is None:
+                raise
+    return {"data": {
+        "status": "succeeded",
+        "desktop_id": target.get("desktop_id"),
+        "device_id": target.get("device_id"),
+        "device_ready": target.get("device_ready") is True,
+        "browser_ready": browser_ready,
+        "agent_installed": result.get("agent_installed") is True,
+        "dependency": {"installed": True, "compatible": True, "adapter_protocol": CREDENTIAL_TARGET_PROTOCOL},
+    }}
+
+
+def _credential_runtime_and_agent(args, state, *, browser):
+    _credential_gateway_preflight(args, state, browser=browser)
+    runtime = cua_dependency.ensure(_dependency_config())
+    command = [
+        sys.executable, str(runtime / "scripts" / "prepare-source.py"),
+        "--timeout-seconds", str(args.timeout_seconds),
+    ]
+    if args.agent_path:
+        command.extend(["--agent-path", args.agent_path])
+    if not browser:
+        command.append("--skip-browser")
+    prepared = _run_credential_script(
+        command, args.timeout_seconds + 15, environment=_credential_subprocess_env(args)
+    )
+    agent = _safe_agent_path(prepared.get("agent_path"))
+    return runtime, agent, prepared
+
+
+def cmd_credentials_sync_browser(args, state, session):
+    del session
+    runtime, agent, _prepared = _credential_runtime_and_agent(args, state, browser=True)
+    command = [
+        sys.executable, str(runtime / "scripts" / "sync-cua.py"),
+        "--agent-path", str(agent),
+        "--target-adapter", str(Path(__file__).resolve()),
+        "--desktop-id", args.desktop_id,
+        "--timeout-seconds", str(args.timeout_seconds),
+        *args.site,
+    ]
+    result = _run_credential_script(
+        command, args.timeout_seconds + 20, environment=_credential_subprocess_env(args)
+    )
+    return {"data": result}
+
+
+def cmd_credentials_sync_resource(args, state, session):
+    del session
+    runtime, agent, _prepared = _credential_runtime_and_agent(args, state, browser=False)
+    command = [
+        sys.executable, str(runtime / "scripts" / "sync-cua-resource.py"),
+        "--agent-path", str(agent),
+        "--target-adapter", str(Path(__file__).resolve()),
+        "--desktop-id", args.desktop_id,
+        "--timeout-seconds", str(args.timeout_seconds),
+        args.resource,
+    ]
+    if args.resource in {"env", "secret"}:
+        command.extend(args.name)
+    elif args.resource == "credential-set":
+        command.extend(["--type", args.set_type, "--name", args.set_name])
+    else:
+        command.extend(["--profile", args.profile])
+    result = _run_credential_script(
+        command, args.timeout_seconds + 20, environment=_credential_subprocess_env(args)
+    )
+    return {"data": result}
+
+
+def cmd_credentials_reset(args, state, session):
+    _credential_gateway_preflight(args, state, reset=True)
+    runtime = cua_dependency.ensure(_dependency_config())
+    command = [
+        sys.executable, str(runtime / "scripts" / "prepare-source.py"),
+        "--timeout-seconds", str(args.timeout_seconds), "--skip-browser",
+    ]
+    if args.agent_path:
+        command.extend(["--agent-path", args.agent_path])
+    prepared = _run_credential_script(
+        command, args.timeout_seconds + 15, environment=_credential_subprocess_env(args)
+    )
+    agent = _safe_agent_path(prepared.get("agent_path"))
+    device_id = str(args.device_id or session.credential_device(args.desktop_id) or "").strip()
+    if not device_id:
+        raise SkillError("VALIDATION_ERROR", "Pass the exact --device-id because no prior target Device ID is recorded.")
+    request_id = session.credential_reset_request(args.desktop_id, device_id)
+    if not session.credential_reset_central_revoked(args.desktop_id, device_id):
+        revoked = subprocess.run(
+            [str(agent), "device", "revoke", "--yes", "--output", "json", "--reason", "reset production CUA credential target", device_id],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=min(args.timeout_seconds, 120),
+            check=False,
+        )
+        if revoked.returncode:
+            raise SkillError("UPSTREAM_FAILURE", "Central Device revocation was not confirmed; target reset was not attempted.")
+        try:
+            revoked_result = json.loads(revoked.stdout)
+        except json.JSONDecodeError as exc:
+            raise SkillError("UPSTREAM_PROTOCOL_ERROR", "Central Device revocation returned invalid structured output.") from exc
+        revoked_device = revoked_result.get("device") if isinstance(revoked_result.get("device"), dict) else {}
+        if revoked_result.get("status") != "revoked" or str(revoked_device.get("id") or "") != device_id:
+            raise SkillError("UPSTREAM_FAILURE", "Central Device revocation did not confirm the exact target Device ID.")
+        session.mark_credential_reset_central_revoked(args.desktop_id, device_id)
+    data = _credential_tool(args, state, "cua_credential_reset", {
+        "desktop_id": args.desktop_id, "device_id": device_id, "request_id": request_id,
+    }, timeout=args.timeout_seconds)
+    if data.get("pair_ready") is not True:
+        raise SkillError("UPSTREAM_FAILURE", "Target reset did not reach pair_ready.")
+    session.finish_credential_reset(args.desktop_id, device_id)
+    return {"data": {
+        "status": "succeeded",
+        "desktop_id": args.desktop_id,
+        "device_id": device_id,
+        "pair_ready": True,
+    }}
 
 
 # -- helpers ---------------------------------------------------------------
@@ -911,6 +1637,7 @@ def build_parser():
     p.set_defaults(handler=cmd_self_test, action="self-test")
 
     _add_semantic_parsers(sub)
+    _add_credential_parsers(sub)
 
     return parser
 
@@ -1031,6 +1758,132 @@ def _add_semantic_parsers(sub):
     p.add_argument("--task-id", help="Task id that owns the artifact. Defaults to the most recent task.")
     p.add_argument("--output", help="Where to write the file. Defaults to a temp file named by content type.")
     p.set_defaults(handler=cmd_artifact_save, action="artifact save")
+
+
+def _add_credential_parsers(sub):
+    credentials = sub.add_parser(
+        "credentials",
+        help="Prepare, synchronize, diagnose, or reset credentials for an owned CUA.",
+    ).add_subparsers(dest="credentials_command")
+
+    p = credentials.add_parser("status", help="Read Credential dependency, source Agent, and target readiness.")
+    p.add_argument("--desktop-id")
+    p.set_defaults(action="credentials status", handler=cmd_credentials_status)
+
+    p = credentials.add_parser("setup", help="Prepare the source Agent and exact target without creating a model task.")
+    p.add_argument("--desktop-id")
+    p.add_argument("--agent-path")
+    p.add_argument("--skip-browser", action="store_true")
+    p.add_argument("--timeout-seconds", type=int, default=600)
+    p.set_defaults(action="credentials setup", handler=cmd_credentials_setup)
+
+    sync = credentials.add_parser("sync", help="Synchronize an explicit browser site or resource.").add_subparsers(
+        dest="credentials_sync_command"
+    )
+    p = sync.add_parser("browser", help="Sync explicitly named signed HTTPS site policies.")
+    p.add_argument("--desktop-id", required=True)
+    p.add_argument("--agent-path")
+    p.add_argument("--timeout-seconds", type=int, default=420)
+    p.add_argument("site", nargs="+")
+    p.set_defaults(action="credentials sync browser", handler=cmd_credentials_sync_browser)
+
+    for resource in ("env", "secret"):
+        p = sync.add_parser(resource, help=f"Sync explicitly named {resource} resources.")
+        p.add_argument("--desktop-id", required=True)
+        p.add_argument("--agent-path")
+        p.add_argument("--timeout-seconds", type=int, default=420)
+        p.add_argument("name", nargs="+")
+        p.set_defaults(
+            action=f"credentials sync {resource}",
+            handler=cmd_credentials_sync_resource,
+            resource=resource,
+        )
+
+    p = sync.add_parser("credential-set", help="Sync one explicitly named Credential Set.")
+    p.add_argument("--desktop-id", required=True)
+    p.add_argument("--agent-path")
+    p.add_argument("--timeout-seconds", type=int, default=420)
+    p.add_argument("--type", dest="set_type", required=True)
+    p.add_argument("--name", dest="set_name", required=True)
+    p.set_defaults(
+        action="credentials sync credential-set",
+        handler=cmd_credentials_sync_resource,
+        resource="credential-set",
+    )
+
+    p = sync.add_parser("file", help="Sync one managed-file profile.")
+    p.add_argument("--desktop-id", required=True)
+    p.add_argument("--agent-path")
+    p.add_argument("--timeout-seconds", type=int, default=420)
+    p.add_argument("--profile", required=True)
+    p.set_defaults(
+        action="credentials sync file",
+        handler=cmd_credentials_sync_resource,
+        resource="file",
+    )
+
+    p = credentials.add_parser("reset", help="Revoke the exact Device centrally, then reset its target.")
+    p.add_argument("--desktop-id", required=True)
+    p.add_argument("--device-id")
+    p.add_argument("--agent-path")
+    p.add_argument("--timeout-seconds", type=int, default=300)
+    p.set_defaults(action="credentials reset", handler=cmd_credentials_reset)
+
+    credential_target = sub.add_parser(
+        "credential-target",
+        help="Internal CUA Target Adapter v1 surface for al-credential-sync.",
+    ).add_subparsers(dest="credential_target_command")
+
+    p = credential_target.add_parser("capabilities")
+    p.add_argument("--desktop-id")
+    p.set_defaults(action="credential-target capabilities", handler=cmd_credential_target_capabilities)
+
+    p = credential_target.add_parser("begin")
+    p.add_argument("--mode", choices=("device", "browser"), required=True)
+    p.add_argument("--desktop-id")
+    p.add_argument("--agent-path", required=True)
+    p.add_argument("--timeout-seconds", type=int, default=240)
+    p.set_defaults(action="credential-target begin", handler=cmd_credential_target_begin)
+
+    p = credential_target.add_parser("health")
+    p.add_argument("--workflow-id", required=True)
+    p.add_argument("--timeout-seconds", type=int, default=45)
+    p.set_defaults(action="credential-target health", handler=cmd_credential_target_health)
+
+    p = credential_target.add_parser(
+        "browser-authorize-begin",
+        help="Compatibility-only read-only HTTPS capability observation.",
+    )
+    p.add_argument("--workflow-id", required=True)
+    p.add_argument("site", nargs="+")
+    p.add_argument("--timeout-seconds", type=int, default=30)
+    p.set_defaults(action="credential-target browser-authorize-begin", handler=cmd_credential_target_authorize_begin)
+
+    p = credential_target.add_parser(
+        "browser-authorize-watch",
+        help="Watch a compatibility HTTPS capability observation without mutation.",
+    )
+    p.add_argument("--operation-id", required=True)
+    p.add_argument("--timeout-seconds", type=int, default=180)
+    p.add_argument("--poll-interval-ms", type=int, default=500)
+    p.set_defaults(action="credential-target browser-authorize-watch", handler=cmd_credential_target_authorize_watch)
+
+    p = credential_target.add_parser("browser-network-ensure")
+    p.add_argument("--workflow-id", required=True)
+    p.add_argument("site", nargs="+")
+    p.add_argument("--timeout-seconds", type=int, default=90)
+    p.set_defaults(action="credential-target browser-network-ensure", handler=cmd_credential_target_network_ensure)
+
+    p = credential_target.add_parser("finish")
+    p.add_argument("--workflow-id", required=True)
+    p.add_argument("--timeout-seconds", type=int, default=30)
+    p.set_defaults(action="credential-target finish", handler=cmd_credential_target_finish)
+
+    p = credential_target.add_parser("reset")
+    p.add_argument("--desktop-id", required=True)
+    p.add_argument("--device-id", required=True)
+    p.add_argument("--timeout-seconds", type=int, default=240)
+    p.set_defaults(action="credential-target reset", handler=cmd_credential_target_reset)
 
 
 def _add_task_args(p):
