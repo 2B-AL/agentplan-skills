@@ -196,6 +196,24 @@ class SessionState(_JsonFile):
         self.save()
         return request_id
 
+    def renew_expired_credential_begin_request(self, desktop_id, mode, expected_request_id):
+        """Replace only the pending begin id the server proved is expired."""
+        key = f"{desktop_id or 'default'}:{mode}"
+        pending = self.data.get("credential_begin_requests")
+        if not isinstance(pending, dict):
+            pending = {}
+        item = pending.get(key)
+        current_request_id = str(
+            item.get("request_id") if isinstance(item, dict) else ""
+        ).strip()
+        if current_request_id and current_request_id != expected_request_id:
+            return current_request_id
+        request_id = "cred-" + uuid.uuid4().hex
+        pending[key] = {"request_id": request_id, "expires_at": int(time.time()) + 3600}
+        self.data["credential_begin_requests"] = pending
+        self.save()
+        return request_id
+
     def complete_credential_begin(self, desktop_id, mode, workflow_id, device_id=None):
         key = f"{desktop_id or 'default'}:{mode}"
         pending = self.data.get("credential_begin_requests")

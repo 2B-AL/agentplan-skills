@@ -824,6 +824,22 @@ def _credential_begin_once(args, state, request_id):
     )
 
 
+def _credential_begin_with_expiry_recovery(args, state, session):
+    request_id = session.credential_begin_request(args.desktop_id, args.mode)
+    try:
+        return _credential_begin_once(args, state, request_id), request_id
+    except SkillError as exc:
+        if not (
+            exc.code == "UPSTREAM_FAILURE"
+            and exc.extra.get("upstream_code") == "CredentialWorkflowExpired"
+        ):
+            raise
+    request_id = session.renew_expired_credential_begin_request(
+        args.desktop_id, args.mode, request_id
+    )
+    return _credential_begin_once(args, state, request_id), request_id
+
+
 def cmd_credential_target_capabilities(args, state, session):
     del session
     payload = {"desktop_id": args.desktop_id} if args.desktop_id else {}
@@ -848,9 +864,8 @@ def cmd_credential_target_begin(args, state, session):
         raise SkillError("TARGET_AGENT_UNAVAILABLE", "--timeout-seconds must be positive.")
     agent_path = _safe_agent_path(args.agent_path)
     deadline = time.monotonic() + args.timeout_seconds
-    request_id = session.credential_begin_request(args.desktop_id, args.mode)
     process = None
-    data = _credential_begin_once(args, state, request_id)
+    data, request_id = _credential_begin_with_expiry_recovery(args, state, session)
     workflow_id = str(data.get("workflow_id") or "").strip()
     if not workflow_id:
         raise SkillError("TARGET_AGENT_UNAVAILABLE", "Gateway did not return an opaque Credential workflow.")

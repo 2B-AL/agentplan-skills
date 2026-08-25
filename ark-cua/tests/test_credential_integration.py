@@ -186,6 +186,55 @@ class CredentialIntegrationTests(unittest.TestCase):
         self.assertEqual(begin_one, begin_two)
         self.assertEqual(reset_one, reset_two)
 
+    def test_expired_server_workflow_rotates_begin_id_once(self):
+        session = mock.Mock()
+        session.credential_begin_request.return_value = "cred-expired"
+        session.renew_expired_credential_begin_request.return_value = "cred-renewed"
+        args = Namespace(
+            desktop_id="desk-1", mode="browser", timeout_seconds=60,
+        )
+        expired = SkillError(
+            "UPSTREAM_FAILURE",
+            "expired",
+            upstream_code="CredentialWorkflowExpired",
+            upstream_status=410,
+        )
+        with mock.patch.object(
+            cua,
+            "_credential_begin_once",
+            side_effect=[expired, {"workflow_id": "workflow-new"}],
+        ) as begin_once:
+            data, request_id = cua._credential_begin_with_expiry_recovery(
+                args, object(), session
+            )
+        self.assertEqual(data["workflow_id"], "workflow-new")
+        self.assertEqual(request_id, "cred-renewed")
+        self.assertEqual(
+            [call.args[2] for call in begin_once.call_args_list],
+            ["cred-expired", "cred-renewed"],
+        )
+        session.renew_expired_credential_begin_request.assert_called_once_with(
+            "desk-1", "browser", "cred-expired"
+        )
+
+    def test_non_expiry_begin_failure_is_not_retried(self):
+        session = mock.Mock()
+        session.credential_begin_request.return_value = "cred-stable"
+        args = Namespace(
+            desktop_id="desk-1", mode="browser", timeout_seconds=60,
+        )
+        failure = SkillError(
+            "UPSTREAM_FAILURE", "failed", upstream_code="MyCUAUnavailable"
+        )
+        with (
+            mock.patch.object(cua, "_credential_begin_once", side_effect=failure) as begin_once,
+            self.assertRaises(SkillError) as raised,
+        ):
+            cua._credential_begin_with_expiry_recovery(args, object(), session)
+        self.assertIs(raised.exception, failure)
+        begin_once.assert_called_once_with(args, mock.ANY, "cred-stable")
+        session.renew_expired_credential_begin_request.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
