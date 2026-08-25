@@ -814,6 +814,22 @@ def _finish_local_relay(process, events, deadline):
     return str(device.get("id") or "").strip() if isinstance(device, dict) else ""
 
 
+def _validate_pair_relay_completion(completed, *, workflow_id, desktop_id, approved_device_id):
+    completed_workflow_id = str(completed.get("workflow_id") or "").strip()
+    completed_desktop_id = str(completed.get("desktop_id") or "").strip()
+    device_id = str(completed.get("device_id") or "").strip()
+    if not device_id:
+        raise SkillError("TARGET_AGENT_UNAVAILABLE", "Gateway did not return the enrolled target Device ID.")
+    if completed_workflow_id != workflow_id or completed_desktop_id != desktop_id:
+        raise SkillError("PAIR_RELAY_TARGET_MISMATCH", "Gateway completed enrollment for a different Credential target.")
+    # Pair approval intentionally returns only pending target metadata. Its
+    # Device ID remains empty until the target completes enrollment, so compare
+    # IDs only when the identity service actually supplied one at approval.
+    if approved_device_id and approved_device_id != device_id:
+        raise SkillError("PAIR_RELAY_TARGET_MISMATCH", "Target enrollment did not match the approved CUA device.")
+    return device_id
+
+
 def _credential_begin_once(args, state, request_id):
     payload = {"mode": args.mode, "request_id": request_id}
     if args.desktop_id:
@@ -910,9 +926,12 @@ def cmd_credential_target_begin(args, state, session):
                 {"operation_id": operation_id},
                 timeout=min(180, max(1, int(deadline - time.monotonic()))),
             )
-            device_id = str(completed.get("device_id") or "").strip()
-            if not approved_device_id or not device_id or approved_device_id != device_id:
-                raise SkillError("PAIR_RELAY_TARGET_MISMATCH", "Target enrollment did not match the approved CUA device.")
+            _validate_pair_relay_completion(
+                completed,
+                workflow_id=workflow_id,
+                desktop_id=str(data.get("desktop_id") or "").strip(),
+                approved_device_id=approved_device_id,
+            )
             data = completed
 
         while True:

@@ -170,6 +170,47 @@ class CredentialIntegrationTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "HOST_PERMISSION_REQUIRED")
         self.assertEqual(raised.exception.extra["job_id"], "job-1")
 
+    def test_pair_relay_accepts_device_id_created_at_completion(self):
+        device_id = cua._validate_pair_relay_completion(
+            {
+                "workflow_id": "workflow-1",
+                "desktop_id": "desk-1",
+                "device_id": "device-created-on-complete",
+            },
+            workflow_id="workflow-1",
+            desktop_id="desk-1",
+            approved_device_id="",
+        )
+        self.assertEqual(device_id, "device-created-on-complete")
+
+    def test_pair_relay_rejects_changed_target_identity(self):
+        with self.assertRaises(SkillError) as raised:
+            cua._validate_pair_relay_completion(
+                {
+                    "workflow_id": "workflow-1",
+                    "desktop_id": "desk-1",
+                    "device_id": "device-unexpected",
+                },
+                workflow_id="workflow-1",
+                desktop_id="desk-1",
+                approved_device_id="device-approved",
+            )
+        self.assertEqual(raised.exception.code, "PAIR_RELAY_TARGET_MISMATCH")
+
+    def test_pair_relay_rejects_changed_workflow_or_desktop(self):
+        for completed in (
+            {"workflow_id": "workflow-other", "desktop_id": "desk-1", "device_id": "device-1"},
+            {"workflow_id": "workflow-1", "desktop_id": "desk-other", "device_id": "device-1"},
+        ):
+            with self.subTest(completed=completed), self.assertRaises(SkillError) as raised:
+                cua._validate_pair_relay_completion(
+                    completed,
+                    workflow_id="workflow-1",
+                    desktop_id="desk-1",
+                    approved_device_id="",
+                )
+            self.assertEqual(raised.exception.code, "PAIR_RELAY_TARGET_MISMATCH")
+
     def test_target_backend_unavailable_is_reported_as_ambiguous_network(self):
         self.assertEqual(
             cua._target_error_code("CUA_BACKEND_UNAVAILABLE"),
