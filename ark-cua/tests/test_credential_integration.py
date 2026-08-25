@@ -170,6 +170,12 @@ class CredentialIntegrationTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "HOST_PERMISSION_REQUIRED")
         self.assertEqual(raised.exception.extra["job_id"], "job-1")
 
+    def test_target_backend_unavailable_is_reported_as_ambiguous_network(self):
+        self.assertEqual(
+            cua._target_error_code("CUA_BACKEND_UNAVAILABLE"),
+            "NETWORK_AMBIGUOUS",
+        )
+
     def test_session_reuses_bounded_begin_and_reset_ids(self):
         with tempfile.TemporaryDirectory() as temp:
             state = SessionState(Path(temp) / "session.json", {})
