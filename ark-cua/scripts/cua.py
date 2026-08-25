@@ -28,7 +28,6 @@ from pathlib import Path
 
 import cua_auth
 import cua_dependency
-from cua_http import gateway_manifest
 from cua_state import AuthState, SessionState
 from cua_util import (
     RETRYABLE_ERROR_CODES,
@@ -694,7 +693,7 @@ def _credential_tool(args, state, name, payload, *, timeout=120):
 
 def _credential_gateway_preflight(args, state, *, browser=False, reset=False):
     base_url = resolve_base_url(args, state)
-    manifest = gateway_manifest(base_url, timeout=30)
+    manifest = cua_auth.authorized_manifest(state, base_url, timeout=30)
     capabilities = manifest.get("capabilities") if isinstance(manifest.get("capabilities"), dict) else {}
     tools = {
         str(tool.get("name") or "").strip()

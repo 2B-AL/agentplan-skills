@@ -107,9 +107,11 @@ def gateway_call(method, base_url, path, token=None, body=None, query=None, time
     _raise_gateway_error(status, payload)
 
 
-def gateway_manifest(base_url, timeout=30):
+def gateway_manifest(base_url, token=None, timeout=30):
     """Read the AgentPlan Skill manifest without changing local or remote state."""
-    status, payload = request("GET", base_url, "/skill/manifest", timeout=timeout)
+    status, payload = request(
+        "GET", base_url, "/skill/manifest", token=token, timeout=timeout
+    )
     if 200 <= status < 300 and isinstance(payload, dict):
         return payload
     _raise_gateway_error(status, payload)

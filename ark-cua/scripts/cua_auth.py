@@ -19,7 +19,13 @@ import tempfile
 import time
 from pathlib import Path
 
-from cua_http import gateway_call, gateway_private_call, gateway_tool_call, raw_request
+from cua_http import (
+    gateway_call,
+    gateway_manifest,
+    gateway_private_call,
+    gateway_tool_call,
+    raw_request,
+)
 from cua_util import RETRYABLE_ERROR_CODES, SkillError, login_setup_command
 
 DEFAULT_LOGIN_TIMEOUT_SEC = 0
@@ -90,6 +96,16 @@ def authorized_raw_call(state, base_url, method, path, body=None, query=None, ti
                 time.sleep(min(2 * attempt, 5))
                 continue
             raise
+
+
+def authorized_manifest(state, base_url, timeout=None):
+    """Read `/skill/manifest` with the redacted AgentPlan credential."""
+    kwargs = {"timeout": timeout} if timeout is not None else {}
+    result, _credential = _with_credential_recovery(
+        state,
+        lambda token: gateway_manifest(base_url, token=token, **kwargs),
+    )
+    return result
 
 
 def authorized_tool_call(state, base_url, tool_name, arguments=None, timeout=None, retries=0):

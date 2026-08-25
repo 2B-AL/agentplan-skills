@@ -13,6 +13,7 @@ SCRIPTS = SKILL / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 import cua  # noqa: E402
+import cua_auth  # noqa: E402
 import cua_http  # noqa: E402
 from cua_state import SessionState  # noqa: E402
 from cua_util import SkillError  # noqa: E402
@@ -37,16 +38,39 @@ class CredentialIntegrationTests(unittest.TestCase):
 
     def test_disabled_manifest_fails_before_dependency_download(self):
         args = Namespace(api_base_url=None, desktop_id="desk-1")
+        state = object()
         manifest = {"capabilities": {"credentials": False}, "tools": []}
         with (
             mock.patch.object(cua, "resolve_base_url", return_value="https://gateway.test"),
-            mock.patch.object(cua, "gateway_manifest", return_value=manifest),
+            mock.patch.object(
+                cua.cua_auth, "authorized_manifest", return_value=manifest
+            ) as authorized_manifest,
             mock.patch.object(cua.cua_dependency, "ensure") as ensure,
             self.assertRaises(SkillError) as raised,
         ):
-            cua._credential_gateway_preflight(args, object(), browser=True)
+            cua._credential_gateway_preflight(args, state, browser=True)
         self.assertEqual(raised.exception.code, "TARGET_CAPABILITY_UNAVAILABLE")
+        authorized_manifest.assert_called_once_with(
+            state, "https://gateway.test", timeout=30
+        )
         ensure.assert_not_called()
+
+    def test_authorized_manifest_uses_redacted_credential_handle(self):
+        credential = cua_auth.CredentialHandle("secret-agentplan-key", "test")
+        manifest = {"capabilities": {"credentials": True}, "tools": []}
+        with (
+            mock.patch.object(cua_auth, "_resolve_credential", return_value=(credential, None)),
+            mock.patch.object(
+                cua_auth, "gateway_manifest", return_value=manifest
+            ) as gateway_manifest,
+        ):
+            result = cua_auth.authorized_manifest(
+                object(), "https://gateway.test/pre", timeout=30
+            )
+        self.assertEqual(result, manifest)
+        gateway_manifest.assert_called_once_with(
+            "https://gateway.test/pre", token="secret-agentplan-key", timeout=30
+        )
 
     def test_browser_sync_uses_pinned_skill_without_permission_mutation(self):
         runtime = Path("/runtime")
