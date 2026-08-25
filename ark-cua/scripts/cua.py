@@ -1581,9 +1581,13 @@ def _derive_desktop_urls(access_url):
 
     path = parts.path or "/"
     segments = path.split("/")
-    if len(segments) >= 3 and segments[1] == "desktops" and segments[2]:
-        desktop_prefix = f"/desktops/{segments[2]}"
-        scope_kind = segments[3] if len(segments) >= 4 else ""
+    try:
+        desktop_index = segments.index("desktops")
+    except ValueError:
+        desktop_index = -1
+    if desktop_index >= 0 and len(segments) > desktop_index + 1 and segments[desktop_index + 1]:
+        desktop_prefix = "/".join(segments[: desktop_index + 2])
+        scope_kind = segments[desktop_index + 2] if len(segments) > desktop_index + 2 else ""
         if scope_kind == "cua-app":
             return None, access_url
         full_path = desktop_prefix + "/cua-app/"
