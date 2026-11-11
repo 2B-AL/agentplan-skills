@@ -1,3 +1,17 @@
+# Copyright (c) 2025 Beijing Volcano Engine Technology Co., Ltd. and/or its affiliates.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Authentication orchestration for the AgentPlan CUA Skill CLI.
 
 This skill variant uses the caller's Volcengine Ark AgentPlan API key as the
@@ -5,6 +19,11 @@ bearer credential. Keys sourced from arkcli stay in memory; manual fallback
 keys are cached locally with 0600 permissions. No key is written to
 stdout/stderr. The gateway validates it with Ark acquire and uses the same key
 as the model API key for CUA runtime calls.
+
+A credential is sent only to the gateway it belongs to: a saved key to the
+gateway it was saved for, and an arkcli AgentPlan key only to the bundled
+AgentPlan gateway. Any other gateway, such as a development environment, needs
+its own login.
 """
 
 import contextlib
@@ -21,16 +40,17 @@ from pathlib import Path
 
 from cua_http import (
     gateway_call,
+    gateway_credential_bootstrap,
     gateway_manifest,
     gateway_private_call,
     gateway_tool_call,
     raw_request,
 )
-from cua_util import RETRYABLE_ERROR_CODES, SkillError, login_setup_command
+from cua_util import RETRYABLE_ERROR_CODES, SkillError, bundled_base_url, login_setup_command, same_gateway
 
 DEFAULT_LOGIN_TIMEOUT_SEC = 0
 ARKCLI_TIMEOUT_SEC = 20
-ARKCLI_SKILL_NAME = "ark-cua"
+ARKCLI_SKILL_NAME = "byted-util-ark-cua"
 ARKCLI_STATE_FILES = ("config.yaml", "profile.yaml", ".env")
 ARKCLI_STATE_DIRS = ("identities", "identity_store")
 
@@ -102,7 +122,7 @@ def authorized_manifest(state, base_url, timeout=None):
     """Read `/skill/manifest` with the redacted AgentPlan credential."""
     kwargs = {"timeout": timeout} if timeout is not None else {}
     result, _credential = _with_credential_recovery(
-        state,
+        state, base_url,
         lambda token: gateway_manifest(base_url, token=token, **kwargs),
     )
     return result
@@ -115,7 +135,7 @@ def authorized_tool_call(state, base_url, tool_name, arguments=None, timeout=Non
         try:
             kwargs = {"timeout": timeout} if timeout is not None else {}
             result, _credential = _with_credential_recovery(
-                state,
+                state, base_url,
                 lambda token: gateway_tool_call(
                     base_url, token, tool_name, arguments or {}, **kwargs
                 ),
@@ -133,8 +153,20 @@ def authorized_private_call(state, base_url, path, arguments=None, timeout=None)
     """Move an encrypted pairing envelope through a fixed private relay path."""
     kwargs = {"timeout": timeout} if timeout is not None else {}
     result, _credential = _with_credential_recovery(
-        state,
+        state, base_url,
         lambda token: gateway_private_call(base_url, token, path, arguments or {}, **kwargs),
+    )
+    return result
+
+
+def authorized_credential_bootstrap(state, base_url, arguments, timeout=None):
+    """Mint one proof-bound assertion without exposing the bearer credential."""
+    kwargs = {"timeout": timeout} if timeout is not None else {}
+    result, _credential = _with_credential_recovery(
+        state, base_url,
+        lambda token: gateway_credential_bootstrap(
+            base_url, token, arguments, **kwargs
+        ),
     )
     return result
 
@@ -144,7 +176,7 @@ def _authorized_call_once(state, base_url, method, path, body=None, query=None, 
     if timeout is not None:
         kwargs["timeout"] = timeout
     data, _credential = _with_credential_recovery(
-        state,
+        state, base_url,
         lambda token: gateway_call(method, base_url, path, token=token, **kwargs),
     )
     return data
@@ -155,24 +187,40 @@ def _authorized_raw_call_once(state, base_url, method, path, body=None, query=No
     if timeout is not None:
         kwargs["timeout"] = timeout
     result, _credential = _with_credential_recovery(
-        state,
+        state, base_url,
         lambda token: raw_request(method, base_url, path, token=token, **kwargs),
     )
     _status, headers, raw = result
     return headers, raw
 
 
-def login(state, base_url, prompt=True, **_unused):
-    """Configure and validate an AgentPlan API key."""
-    credential, arkcli_discovery = _arkcli_credential()
-    if not credential and prompt:
-        if not sys.stdin.isatty():
-            raise _auth_required(arkcli_discovery)
+def login(state, base_url, prompt=True, manual=False, **_unused):
+    """Configure and validate the gateway's API key (AgentPlan) or token (another environment)."""
+    credential = None
+    arkcli_discovery = None
+    agentplan = agentplan_gateway(base_url)
+    label = "AgentPlan API key" if agentplan else "API key or environment token for " + base_url
+    if manual:
+        if not prompt or not sys.stdin.isatty():
+            raise _auth_required(manual=True, base_url=base_url)
         credential = CredentialHandle.optional(
-            getpass.getpass("AgentPlan API key: "), "prompt"
+            getpass.getpass(label + " (manual): "), "manual"
         )
+        if not credential:
+            raise _auth_required(manual=True, base_url=base_url)
+    else:
+        if agentplan:
+            credential, arkcli_discovery = _arkcli_credential()
+        else:
+            arkcli_discovery = {"status": "gateway_login_required"}
+        if not credential and prompt:
+            if not sys.stdin.isatty():
+                raise _auth_required(arkcli_discovery, base_url=base_url)
+            credential = CredentialHandle.optional(
+                getpass.getpass(label + ": "), "prompt"
+            )
     if not credential:
-        raise _auth_required(arkcli_discovery)
+        raise _auth_required(arkcli_discovery, base_url=base_url)
 
     try:
         data = credential.invoke(
@@ -181,20 +229,20 @@ def login(state, base_url, prompt=True, **_unused):
     except SkillError as exc:
         if credential.source == "arkcli" and _is_agentplan_auth_rejection(exc):
             if not prompt or not sys.stdin.isatty():
-                raise _auth_required({"status": "api_key_rejected", "profile": credential.profile})
+                raise _auth_required({"status": "api_key_rejected", "profile": credential.profile}, base_url=base_url)
             credential = CredentialHandle.optional(
                 getpass.getpass("AgentPlan API key (arkcli fallback): "), "prompt"
             )
             if not credential:
-                raise _auth_required({"status": "api_key_rejected"})
+                raise _auth_required({"status": "api_key_rejected"}, base_url=base_url)
             try:
                 data = credential.invoke(
                     lambda value: gateway_call("GET", base_url, "/v1/auth/me", token=value)
                 )
             except SkillError as fallback_exc:
-                raise _auth_error_with_retry(fallback_exc)
+                raise _auth_error_with_retry(fallback_exc, base_url=base_url)
         else:
-            raise _auth_error_with_retry(exc)
+            raise _auth_error_with_retry(exc, manual=credential.source == "manual", base_url=base_url)
     user = _safe_user(data.get("user") or data.get("caller") or data)
     # arkcli remains the source of truth. Its key is used only by this process
     # and is deliberately not copied into the CUA auth cache.
@@ -205,6 +253,7 @@ def login(state, base_url, prompt=True, **_unused):
                 api_key=value,
                 user=user,
                 desktop_bound=bool(data.get("desktop_bound")),
+                credential_source=credential.source,
             )
         )
     result = {
@@ -215,6 +264,9 @@ def login(state, base_url, prompt=True, **_unused):
         "desktop_bound": bool(data.get("desktop_bound")),
         "scopes": _scopes(data),
     }
+    verification = _safe_real_name_verification(data.get("real_name_verification"))
+    if verification:
+        result["real_name_verification"] = verification
     if credential.profile:
         result["arkcli_profile"] = credential.profile
     return result
@@ -223,17 +275,18 @@ def login(state, base_url, prompt=True, **_unused):
 def auth_status(state, base_url):
     """Verify the current API key against /v1/auth/me without exposing it."""
     data, credential = _with_credential_recovery(
-        state,
+        state, base_url,
         lambda token: gateway_call("GET", base_url, "/v1/auth/me", token=token),
     )
     user = _safe_user(data.get("user") or data.get("caller") or data)
-    if user and user != state.user and credential.source == "cache":
+    if user and user != state.user and credential.source in ("cache", "manual"):
         credential.invoke(
             lambda value: state.set_api_key(
                 api_base_url=base_url,
                 api_key=value,
                 user=user,
                 desktop_bound=bool(data.get("desktop_bound")),
+                credential_source=getattr(state, "credential_source", None),
             )
         )
     result = {
@@ -245,12 +298,17 @@ def auth_status(state, base_url):
         "scopes": _scopes(data),
         "desktop_bound": bool(data.get("desktop_bound") or state.desktop_bound),
     }
+    verification = _safe_real_name_verification(data.get("real_name_verification"))
+    if verification:
+        result["real_name_verification"] = verification
     if credential.profile:
         result["arkcli_profile"] = credential.profile
     return result
 
 
 def logout(state, base_url):
+    # Forget the gateway with the login, so later commands return to the bundled one.
+    state.data.pop("api_base_url", None)
     state.clear_tokens()
     return {"status": "logged_out"}
 
@@ -258,23 +316,41 @@ def logout(state, base_url):
 # -- internals -------------------------------------------------------------
 
 
-def _resolve_credential(state):
-    cached = CredentialHandle.optional(state.access_token, "cache")
+def agentplan_gateway(base_url):
+    """Whether base_url is the bundled AgentPlan gateway, the only one arkcli keys are for."""
+    return same_gateway(base_url, bundled_base_url())
+
+
+def saved_for_gateway(state, base_url):
+    """Whether the saved credential belongs to base_url: the gateway it was saved
+    with, or the bundled AgentPlan gateway for a file that recorded none."""
+    return bool(state.access_token) and same_gateway(state.api_base_url or bundled_base_url(), base_url)
+
+
+def _resolve_credential(state, base_url):
+    source = "manual" if getattr(state, "credential_source", None) == "manual" else "cache"
+    cached = CredentialHandle.optional(state.access_token, source) if saved_for_gateway(state, base_url) else None
     if cached:
         return cached, None
+    if not agentplan_gateway(base_url):
+        return None, {"status": "gateway_login_required"}
     return _arkcli_credential()
 
 
-def _with_credential_recovery(state, operation):
-    credential, discovery = _resolve_credential(state)
+def _with_credential_recovery(state, base_url, operation):
+    credential, discovery = _resolve_credential(state, base_url)
     if not credential:
-        raise _auth_required(discovery)
+        raise _auth_required(discovery, base_url=base_url)
     try:
         return credential.invoke(operation), credential
     except SkillError as exc:
         if _is_agentplan_auth_rejection(exc):
             if credential.source == "arkcli":
-                raise _auth_required({"status": "api_key_rejected", "profile": credential.profile})
+                raise _auth_required({"status": "api_key_rejected", "profile": credential.profile}, base_url=base_url)
+            if credential.source == "manual":
+                raise _auth_required(manual=True, base_url=base_url)
+            if not agentplan_gateway(base_url):
+                raise _auth_required({"status": "gateway_login_required"}, base_url=base_url)
             arkcli_credential, arkcli_discovery = _arkcli_credential()
             if arkcli_credential and not arkcli_credential.same_value(credential):
                 try:
@@ -284,16 +360,15 @@ def _with_credential_recovery(state, operation):
                         raise _auth_required({
                             "status": "api_key_rejected",
                             "profile": arkcli_credential.profile,
-                        })
-                    raise _auth_error_with_retry(arkcli_exc)
+                        }, base_url=base_url)
+                    raise _auth_error_with_retry(arkcli_exc, base_url=base_url)
             if arkcli_credential:
                 raise _auth_required({
                     "status": "api_key_rejected",
                     "profile": arkcli_credential.profile,
-                })
-            if not arkcli_credential:
-                raise _auth_required(arkcli_discovery)
-        raise _auth_error_with_retry(exc)
+                }, base_url=base_url)
+            raise _auth_required(arkcli_discovery, base_url=base_url)
+        raise _auth_error_with_retry(exc, base_url=base_url)
 
 
 def _arkcli_credential():
@@ -406,8 +481,23 @@ def _arkcli_error_status(stderr, fallback):
     return error_type if isinstance(error_type, str) and error_type else fallback
 
 
-def _auth_required(discovery=None):
+def _auth_required(discovery=None, manual=False, base_url=None):
+    if manual:
+        return SkillError(
+            "AUTH_REQUIRED",
+            "Manual AgentPlan API key login requires a local hidden prompt." if base_url is None or agentplan_gateway(base_url)
+            else "Manual login to this gateway requires a local hidden prompt.",
+            setup_command=login_setup_command(manual=True, base_url=base_url),
+            manual_login_required=True,
+        )
     status = (discovery or {}).get("status") or "unavailable"
+    if status == "gateway_login_required":
+        return SkillError(
+            "AUTH_REQUIRED",
+            "This CUA gateway needs its own login; credentials saved for another gateway and arkcli's AgentPlan key are not sent to it.",
+            setup_command=login_setup_command(base_url=base_url),
+            gateway_login_required=True,
+        )
     hints = {
         "not_installed": "arkcli is not installed; use the local hidden API-key prompt.",
         "no_agent_plan_max_profile": "arkcli has no personal Agent Plan Max profile; log in or open that plan, then retry.",
@@ -418,26 +508,34 @@ def _auth_required(discovery=None):
     return SkillError(
         "AUTH_REQUIRED",
         "AgentPlan API key required for CUA Skill.",
-        setup_command=login_setup_command(),
+        setup_command=login_setup_command(base_url=base_url),
         arkcli_status=status,
         arkcli_hint=hints.get(status, "arkcli could not supply an Agent Plan Max API key; use the local hidden API-key prompt."),
     )
 
 
-def _auth_error_with_retry(exc):
+def _auth_error_with_retry(exc, manual=False, base_url=None):
     if _is_agentplan_auth_rejection(exc):
+        # Another environment's rejection asks for that environment's own login.
+        other = base_url is not None and not agentplan_gateway(base_url)
         return SkillError(
             "AUTH_REQUIRED",
-            "AgentPlan APIKey 不合法，请输入正确的 APIKey。",
-            setup_command=login_setup_command(),
+            "This CUA gateway rejected the API key or token; log in to it again." if other else "AgentPlan APIKey 不合法，请输入正确的 APIKey。",
+            setup_command=login_setup_command(manual=manual, base_url=base_url),
+            manual_login_required=manual or None,
+            gateway_login_required=other or None,
             auth_type="agentplan_bearer",
         )
     if exc.code in ("AUTH_REQUIRED", "TOKEN_EXPIRED", "REFRESH_FAILED") and "setup_command" not in exc.extra:
-        exc.extra["setup_command"] = login_setup_command()
+        exc.extra["setup_command"] = login_setup_command(manual=manual, base_url=base_url)
+        if manual:
+            exc.extra["manual_login_required"] = True
     return exc
 
 
 def _is_agentplan_auth_rejection(exc):
+    if exc.code in ("VOLCENGINE_REAL_NAME_REQUIRED", "VOLCENGINE_REAL_NAME_CHECK_UNAVAILABLE"):
+        return False
     if exc.code not in ("AUTH_REQUIRED", "TOKEN_EXPIRED", "FORBIDDEN"):
         return False
     if exc.extra.get("auth_type") == "agentplan_bearer":
@@ -474,4 +572,21 @@ def _safe_user(user):
         "org_id": user.get("org_id"),
         "user_id": user.get("user_id"),
         "email": user.get("email"),
+    }
+
+
+def _safe_real_name_verification(value):
+    if not isinstance(value, dict):
+        return {}
+    return {
+        key: value.get(key)
+        for key in (
+            "status",
+            "new_cua_allocation_allowed",
+            "checked_at",
+            "expires_at",
+            "source",
+            "verification_url",
+        )
+        if value.get(key) is not None
     }

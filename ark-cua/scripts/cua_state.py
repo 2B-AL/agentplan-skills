@@ -1,3 +1,17 @@
+# Copyright (c) 2025 Beijing Volcano Engine Technology Co., Ltd. and/or its affiliates.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Local caches for the AgentPlan CUA Skill CLI.
 
 `AuthState` stores the API base URL, user identity, and AgentPlan API key in
@@ -21,6 +35,21 @@ from cua_util import SkillError
 DEFAULT_DIR = Path.home() / ".openclaw" / "ark-cua"
 DEFAULT_AUTH_FILE = DEFAULT_DIR / "auth.json"
 DEFAULT_SESSION_FILE = DEFAULT_DIR / "session.json"
+
+
+def _credential_state_key(environment_id, *parts):
+    """Build a collision-safe key for environment-isolated Credential state."""
+    environment = str(environment_id or "").strip().lower()
+    if environment != "prod":
+        raise SkillError(
+            "VALIDATION_ERROR",
+            "Credential session state requires the production environment.",
+        )
+    return json.dumps(
+        [environment, *(str(part or "") for part in parts)],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
 
 
 def auth_file_path():
@@ -89,6 +118,10 @@ class AuthState(_JsonFile):
         return self.data.get("api_key")
 
     @property
+    def credential_source(self):
+        return self.data.get("credential_source")
+
+    @property
     def refresh_token(self):
         return None
 
@@ -117,23 +150,27 @@ class AuthState(_JsonFile):
             "access_token_expires_at": access_token_expires_at,
             "desktop_bound": desktop_bound,
         })
+        self.data.pop("credential_source", None)
         self.save()
 
-    def set_api_key(self, *, api_base_url, api_key, user=None, desktop_bound=False):
+    def set_api_key(self, *, api_base_url, api_key, user=None, desktop_bound=False,
+                    credential_source=None):
         self.data.update({
             "api_base_url": api_base_url,
             "api_key": api_key,
             "user": user or {},
             "desktop_bound": bool(desktop_bound),
         })
+        if credential_source:
+            self.data["credential_source"] = credential_source
         for key in ("access_token", "access_token_expires_at", "refresh_token",
                     "refresh_token_expires_at"):
             self.data.pop(key, None)
         self.save()
 
     def clear_tokens(self):
-        for key in ("api_key", "access_token", "access_token_expires_at", "refresh_token",
-                    "refresh_token_expires_at", "user", "desktop_bound"):
+        for key in ("api_key", "credential_source", "access_token", "access_token_expires_at",
+                    "refresh_token", "refresh_token_expires_at", "user", "desktop_bound"):
             self.data.pop(key, None)
         self.save()
 
@@ -180,8 +217,27 @@ class SessionState(_JsonFile):
         if changed:
             self.save()
 
-    def credential_begin_request(self, desktop_id, mode):
-        key = f"{desktop_id or 'default'}:{mode}"
+    # The id of the browser sync connection this computer last wrote into its
+    # CookieCloud extension, per Gateway. The id is not a secret; the
+    # extension's credentials are never stored here.
+    def browser_sync_extension(self, base_url):
+        records = self.data.get("browser_sync_extension")
+        value = records.get(base_url) if isinstance(records, dict) else None
+        return value if isinstance(value, str) and value else None
+
+    def remember_browser_sync_extension(self, base_url, connection_id):
+        records = self.data.get("browser_sync_extension")
+        self.data["browser_sync_extension"] = {**(records if isinstance(records, dict) else {}), base_url: connection_id}
+        self.save()
+
+    def forget_browser_sync_extension(self, base_url, connection_id):
+        records = self.data.get("browser_sync_extension")
+        if isinstance(records, dict) and records.get(base_url) == connection_id:
+            del records[base_url]
+            self.save()
+
+    def credential_begin_request(self, environment_id, desktop_id, mode):
+        key = _credential_state_key(environment_id, desktop_id or "default", mode)
         pending = self.data.get("credential_begin_requests")
         if not isinstance(pending, dict):
             pending = {}
@@ -196,9 +252,11 @@ class SessionState(_JsonFile):
         self.save()
         return request_id
 
-    def renew_expired_credential_begin_request(self, desktop_id, mode, expected_request_id):
+    def renew_expired_credential_begin_request(
+        self, environment_id, desktop_id, mode, expected_request_id
+    ):
         """Replace only the pending begin id the server proved is expired."""
-        key = f"{desktop_id or 'default'}:{mode}"
+        key = _credential_state_key(environment_id, desktop_id or "default", mode)
         pending = self.data.get("credential_begin_requests")
         if not isinstance(pending, dict):
             pending = {}
@@ -214,8 +272,10 @@ class SessionState(_JsonFile):
         self.save()
         return request_id
 
-    def complete_credential_begin(self, desktop_id, mode, workflow_id, device_id=None):
-        key = f"{desktop_id or 'default'}:{mode}"
+    def complete_credential_begin(
+        self, environment_id, desktop_id, mode, workflow_id, device_id=None
+    ):
+        key = _credential_state_key(environment_id, desktop_id or "default", mode)
         pending = self.data.get("credential_begin_requests")
         if isinstance(pending, dict):
             pending.pop(key, None)
@@ -223,7 +283,8 @@ class SessionState(_JsonFile):
         workflows = self.data.get("credential_workflows")
         if not isinstance(workflows, dict):
             workflows = {}
-        workflows[workflow_id] = {
+        workflows[_credential_state_key(environment_id, workflow_id)] = {
+            "environment_id": environment_id,
             "desktop_id": desktop_id or "",
             "mode": mode,
             "updated_at": int(time.time()),
@@ -233,16 +294,17 @@ class SessionState(_JsonFile):
             devices = self.data.get("credential_devices")
             if not isinstance(devices, dict):
                 devices = {}
-            devices[desktop_id or "default"] = device_id
+            devices[_credential_state_key(environment_id, desktop_id or "default")] = device_id
             self.data["credential_devices"] = devices
         self.save()
 
-    def credential_device(self, desktop_id):
+    def credential_device(self, environment_id, desktop_id):
         devices = self.data.get("credential_devices")
-        return devices.get(desktop_id or "default") if isinstance(devices, dict) else None
+        key = _credential_state_key(environment_id, desktop_id or "default")
+        return devices.get(key) if isinstance(devices, dict) else None
 
-    def credential_reset_request(self, desktop_id, device_id):
-        key = f"{desktop_id}:{device_id}"
+    def credential_reset_request(self, environment_id, desktop_id, device_id):
+        key = _credential_state_key(environment_id, desktop_id, device_id)
         resets = self.data.get("credential_reset_requests")
         if not isinstance(resets, dict):
             resets = {}
@@ -255,13 +317,14 @@ class SessionState(_JsonFile):
             self.save()
         return request_id
 
-    def credential_reset_central_revoked(self, desktop_id, device_id):
+    def credential_reset_central_revoked(self, environment_id, desktop_id, device_id):
         resets = self.data.get("credential_reset_requests")
-        item = resets.get(f"{desktop_id}:{device_id}") if isinstance(resets, dict) else None
+        key = _credential_state_key(environment_id, desktop_id, device_id)
+        item = resets.get(key) if isinstance(resets, dict) else None
         return isinstance(item, dict) and item.get("central_revoked") is True
 
-    def mark_credential_reset_central_revoked(self, desktop_id, device_id):
-        key = f"{desktop_id}:{device_id}"
+    def mark_credential_reset_central_revoked(self, environment_id, desktop_id, device_id):
+        key = _credential_state_key(environment_id, desktop_id, device_id)
         resets = self.data.get("credential_reset_requests")
         if not isinstance(resets, dict):
             resets = {}
@@ -273,38 +336,45 @@ class SessionState(_JsonFile):
         self.data["credential_reset_requests"] = resets
         self.save()
 
-    def finish_credential_reset(self, desktop_id, device_id):
+    def finish_credential_reset(self, environment_id, desktop_id, device_id):
         resets = self.data.get("credential_reset_requests")
         if isinstance(resets, dict):
-            resets.pop(f"{desktop_id}:{device_id}", None)
+            resets.pop(_credential_state_key(environment_id, desktop_id, device_id), None)
             self.data["credential_reset_requests"] = resets
         devices = self.data.get("credential_devices")
         if isinstance(devices, dict):
-            devices.pop(desktop_id or "default", None)
+            devices.pop(
+                _credential_state_key(environment_id, desktop_id or "default"), None
+            )
             self.data["credential_devices"] = devices
         self.save()
 
-    def remember_credential_operation(self, operation_id, workflow_id):
+    def remember_credential_operation(self, environment_id, operation_id, workflow_id):
         operations = self.data.get("credential_operations")
         if not isinstance(operations, dict):
             operations = {}
-        operations[operation_id] = workflow_id
+        operations[_credential_state_key(environment_id, operation_id)] = workflow_id
         self.data["credential_operations"] = operations
         self.save()
 
-    def workflow_for_credential_operation(self, operation_id):
+    def workflow_for_credential_operation(self, environment_id, operation_id):
         operations = self.data.get("credential_operations")
-        return operations.get(operation_id) if isinstance(operations, dict) else None
+        key = _credential_state_key(environment_id, operation_id)
+        return operations.get(key) if isinstance(operations, dict) else None
 
-    def finish_credential_workflow(self, workflow_id):
+    def finish_credential_workflow(self, environment_id, workflow_id):
+        workflow_key = _credential_state_key(environment_id, workflow_id)
+        environment_prefix = workflow_key.split(",", 1)[0] + ","
         workflows = self.data.get("credential_workflows")
         if isinstance(workflows, dict):
-            workflows.pop(workflow_id, None)
+            workflows.pop(workflow_key, None)
             self.data["credential_workflows"] = workflows
         operations = self.data.get("credential_operations")
         if isinstance(operations, dict):
             self.data["credential_operations"] = {
-                key: value for key, value in operations.items() if value != workflow_id
+                key: value
+                for key, value in operations.items()
+                if not (key.startswith(environment_prefix) and value == workflow_id)
             }
         self.save()
 

@@ -1,4 +1,18 @@
 #!/usr/bin/env python3
+# Copyright (c) 2025 Beijing Volcano Engine Technology Co., Ltd. and/or its affiliates.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """AgentPlan CUA Skill CLI — the single entrypoint an agent calls to drive CUA.
 
     python3 <skill_dir>/scripts/cua.py <command> [options]
@@ -8,8 +22,9 @@ Every invocation prints exactly one JSON object:
     {"ok": true,  "action": "<command>", "data": {...}, "next": {...}}
     {"ok": false, "action": "<command>", "error": {"code": "...", "message": "..."}}
 
-Stdlib only. API keys, authorization headers, cache contents, and artifact bytes
-are never printed. See references/ for command and error documentation.
+The core CLI uses the Python standard library; optional local CookieCloud
+configuration uses Node.js 22+. API keys, authorization headers, cache contents,
+and artifact bytes are never printed. See references/ for command documentation.
 """
 
 import argparse
@@ -17,6 +32,7 @@ import base64
 import json
 import os
 import queue
+import secrets
 import stat
 import subprocess
 import sys
@@ -27,17 +43,18 @@ import urllib.parse
 from pathlib import Path
 
 import cua_auth
-import cua_dependency
+import cua_http
 from cua_state import AuthState, SessionState
 from cua_util import (
     RETRYABLE_ERROR_CODES,
     SkillError,
+    bundled_base_url,
+    command_prefix,
     emit_error,
     emit_success,
     ext_for_mime,
     login_setup_command,
     now_epoch,
-    script_path,
 )
 
 # Long tasks use repeated waits. Each request stays within the gateway's 60-second
@@ -47,23 +64,16 @@ RESULT_POLL_WAIT_MS = 20000
 SERVER_WAIT_CHUNK_MS = 60000
 IDEMPOTENT_RETRIES = 2
 CREDENTIAL_TARGET_PROTOCOL = "cua-target/v1"
+CREDENTIAL_RUNTIME = Path(__file__).resolve().parents[1]
 CREDENTIAL_PAIR_POLL_INTERVAL_SEC = 0.5
 CREDENTIAL_GATEWAY_TOOLS = {
     "cua_credential_capabilities",
     "cua_credential_begin",
     "cua_credential_health",
-    "cua_credential_browser_authorize_begin",
-    "cua_credential_browser_authorize_watch",
-    "cua_credential_browser_network_ensure",
     "cua_credential_finish",
     "cua_credential_reset",
 }
 CREDENTIAL_DEVICE_FEATURES = {"initialize", "pair-relay-v1", "health-v1"}
-CREDENTIAL_BROWSER_FEATURES = CREDENTIAL_DEVICE_FEATURES | {
-    "browser-unpacked-ensure",
-    "browser-authorize-v1",
-    "browser-network-ensure-v1",
-}
 
 
 def emit_target_success(action, data):
@@ -205,6 +215,10 @@ def resolve_base_url(args, state, persist=False):
         )
     base_url = _validate_base_url(base_url)
     if persist and state.api_base_url != base_url:
+        # One login is saved at a time. A login saved for another gateway is
+        # removed here, so no later command sends it to this one.
+        if state.access_token and not cua_auth.saved_for_gateway(state, base_url):
+            state.clear_tokens()
         state.set_api_base_url(base_url)
     return base_url
 
@@ -239,30 +253,6 @@ def _validate_base_url(base_url):
     return base_url
 
 
-def bundled_base_url():
-    """Gateway URL shipped as a bundled asset (publisher-set, once)."""
-    data = bundled_config()
-    url = data.get("api_base_url")
-    if not isinstance(url, str):
-        return None
-    url = url.strip()
-    if not url or url.startswith("<") or "REPLACE" in url or "example.com" in url:
-        return None
-    return url
-
-
-def bundled_config():
-    """Read the publisher-controlled, non-secret bundled configuration."""
-    try:
-        cfg_path = Path(__file__).resolve().parent.parent / "assets" / "config.json"
-        if not cfg_path.exists():
-            return {}
-        data = json.loads(cfg_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
 # -- auth commands ---------------------------------------------------------
 
 
@@ -276,6 +266,7 @@ def cmd_auth_login(args, state, session):
     return {"data": cua_auth.login(
         state, base_url,
         prompt=not args.no_prompt,
+        manual=args.manual,
     )}
 
 
@@ -387,10 +378,60 @@ def cmd_desktop_list(args, state, session):
     return {"data": data}
 
 
+class _ExtensionRecord:
+    """This computer's record of the connection its CookieCloud extension uploads to, for one Gateway."""
+
+    def __init__(self, session, base_url):
+        self.session, self.base_url = session, base_url
+
+    def get(self):
+        return self.session.browser_sync_extension(self.base_url)
+
+    def remember(self, connection_id):
+        self.session.remember_browser_sync_extension(self.base_url, connection_id)
+
+    def forget(self, connection_id):
+        self.session.forget_browser_sync_extension(self.base_url, connection_id)
+
+
+def _browser_sync(args, state, session, operation):
+    base_url = resolve_base_url(args, state)
+    api = lambda method, path, body: cua_auth.authorized_call(  # noqa: E731 - the helper's one-call API
+        state, base_url, method, path, body=body, timeout=30,
+    )
+    try:
+        return operation(args, api, _ExtensionRecord(session, base_url))
+    except SkillError as exc:
+        if exc.code in RETRYABLE_ERROR_CODES:
+            raise SkillError("COOKIECLOUD_API_UNAVAILABLE", "Browser sync could not be confirmed on the current Gateway. Check its availability before retrying; no model task was started.") from None
+        raise
+
+
+def cmd_browser_sync(args, state, session):
+    from cua_cookiecloud import synchronize
+
+    return _browser_sync(args, state, session, synchronize)
+
+
+def cmd_browser_sync_leave(args, state, session):
+    from cua_cookiecloud import leave
+
+    return _browser_sync(args, state, session, lambda args, api, memory: leave(args, api))
+
+
+def cmd_browser_sync_revoke(args, state, session):
+    from cua_cookiecloud import revoke
+
+    return _browser_sync(args, state, session, revoke)
+
+
 def cmd_desktop_access(args, state, session):
     base_url = resolve_base_url(args, state)
+    path = "/v1/desktop/access"
+    if getattr(args, "desktop", None):
+        path += "?" + urllib.parse.urlencode({"desktop": args.desktop})
     data = cua_auth.authorized_call(
-        state, base_url, "GET", "/v1/desktop/access", timeout=120,
+        state, base_url, "GET", path, timeout=120,
         retries=IDEMPOTENT_RETRIES,
     )
     access_url = data.get("access_url")
@@ -400,9 +441,13 @@ def cmd_desktop_access(args, state, session):
             data["desktop_view_url"] = desktop_view_url
         if full_interface_url:
             data["full_interface_url"] = full_interface_url
-    return {"data": data, "next": {
-        "agent_hint": "Return this newly issued full_interface_url (or access_url when unavailable) only when the user requested the CUA App link. Never reuse a URL from an earlier command result. If opening it reports runtime_capability_required, revoke this ticket and run desktop access once for a fresh URL; do not rewrite the path.",
-    }}
+    hint = (
+        "Return this newly issued full_interface_url (or access_url when unavailable) only when "
+        "the user's task requires CUA App access. Never reuse a URL from an earlier command result. "
+        "If opening it reports runtime_capability_required, revoke this ticket and run desktop "
+        "access once for a fresh URL; do not rewrite the path."
+    )
+    return {"data": data, "next": {"agent_hint": hint}}
 
 
 def cmd_desktop_revoke_access(args, state, session):
@@ -414,6 +459,87 @@ def cmd_desktop_revoke_access(args, state, session):
     )
     return {"data": data, "next": {
         "agent_hint": "The temporary CUA App URL has been revoked. Run desktop access if the user needs a new link.",
+    }}
+
+
+def cmd_desktop_shutdown(args, state, session):
+    base_url = resolve_base_url(args, state)
+    body = {
+        "confirm": True,
+        "idempotency_key": args.idempotency_key,
+        "reason": "user_requested_shutdown",
+    }
+    if args.desktop:
+        body["desktop_id"] = args.desktop
+    data = cua_auth.authorized_call(
+        state, base_url, "POST", "/v1/desktop/release", body=body,
+    )
+    operation_id = data.get("operation_id")
+    next_action = {
+        "agent_hint": "The shutdown request ended billing entitlement and revoked desktop access. "
+        "Physical stop or deletion is asynchronous; do not use the old desktop. If "
+        "data.operation.recoverable is true, retain data.desktop.desktop_id and "
+        "data.operation.purge_after so a later explicit desktop start can recover it before the "
+        "retention deadline.",
+    }
+    if operation_id:
+        next_action["command"] = (
+            f"{command_prefix()} desktop operation --operation-id {operation_id}"
+        )
+    return {"data": data, "next": next_action}
+
+
+def cmd_desktop_start(args, state, session):
+    base_url = resolve_base_url(args, state)
+    body = {"idempotency_key": args.idempotency_key}
+    if args.desktop:
+        body["desktop_id"] = args.desktop
+    data = cua_auth.authorized_call(
+        state, base_url, "POST", "/v1/desktop/start", body=body,
+    )
+    operation = data.get("operation") if isinstance(data.get("operation"), dict) else {}
+    operation_id = data.get("operation_id") or operation.get("operation_id")
+    action = data.get("action") or "start"
+    if operation_id:
+        return {"data": data, "next": {
+            "command": f"{command_prefix()} desktop operation --operation-id {operation_id}",
+            "agent_hint": (
+                f"Desktop {action} is in progress. Keep checking this logical operation until it "
+                "is terminal; only succeeded means the desktop and its required access and "
+                "entitlement state are ready."
+            ),
+        }}
+    return {"data": data, "next": {
+        "agent_hint": (
+            f"Desktop start completed with action {action}. Use data.restoring and "
+            "data.newly_allocated to distinguish retained recovery from reuse or new allocation."
+        ),
+    }}
+
+
+def cmd_desktop_operation(args, state, session):
+    base_url = resolve_base_url(args, state)
+    data = cua_auth.authorized_call(
+        state,
+        base_url,
+        "GET",
+        f"/v1/desktop/operations/{args.operation_id}",
+        retries=IDEMPOTENT_RETRIES,
+    )
+    status = data.get("status")
+    terminal = data.get("terminal") is True
+    if terminal:
+        hint = (
+            "The desktop lifecycle operation is terminal. Report whether it succeeded or failed "
+            "from data.status and data.operation."
+        )
+        return {"data": data, "next": {"agent_hint": hint}}
+    return {"data": data, "next": {
+        "command": f"{command_prefix()} desktop operation --operation-id {args.operation_id}",
+        "agent_hint": (
+            f"The desktop lifecycle operation is still {status or 'running'}. Keep checking this "
+            "same operation; do not submit another start or shutdown request."
+        ),
     }}
 
 
@@ -531,7 +657,7 @@ def cmd_context_create(args, state, session):
     if context_id:
         session.set_last(last_context_id=context_id)
     return {"data": data, "next": {
-        "command": f"python3 {script_path()} task continue --context-id {context_id} --objective \"<TASK>\"",
+        "command": f"{command_prefix()} task continue --context-id {context_id} --objective \"<TASK>\"",
         "agent_hint": "Context created. Add background with context add-note, or start work with task continue.",
     }}
 
@@ -664,19 +790,24 @@ def cmd_artifact_save(args, state, session):
 
 def cmd_self_test(args, state, session):
     """Local-only checks. Does not create CUA tasks or call backends."""
+    base_url = resolve_base_url(args, state) if _has_base_url(args, state) else None
     checks = {
         "python_version": sys.version.split()[0],
         "python_ok": sys.version_info >= (3, 8),
         "auth_file": str(state.path),
-        "logged_in": bool(state.access_token),
-        "api_base_url": resolve_base_url(args, state) if _has_base_url(args, state) else None,
+        # A saved login counts only for the gateway it was saved for.
+        "logged_in": bool(base_url) and cua_auth.saved_for_gateway(state, base_url),
+        "api_base_url": base_url,
         "last_invocation_id": session.last_invocation_id,
-        "credential_dependency": cua_dependency.configuration(_dependency_config()),
+        "credential_runtime": {
+            "embedded": True,
+            "adapter_protocol": CREDENTIAL_TARGET_PROTOCOL,
+        },
     }
     next_hint = None
     if not checks["logged_in"]:
         next_hint = {
-            "setup_command": login_setup_command(),
+            "setup_command": login_setup_command(base_url=base_url),
             "agent_hint": "Not logged in yet. Do not run setup_command yourself; ask the user to run it in a local terminal before real work.",
         }
     return {"data": checks, "next": next_hint} if next_hint else {"data": checks}
@@ -692,7 +823,19 @@ def _credential_tool(args, state, name, payload, *, timeout=120):
     )
 
 
-def _credential_gateway_preflight(args, state, *, browser=False, reset=False):
+def _credential_runtime_environment():
+    environment_id = str(
+        os.environ.get("CREDENTIAL_AGENT_ENVIRONMENT_ID") or ""
+    ).strip().lower()
+    if environment_id != "prod":
+        raise SkillError(
+            "TARGET_CAPABILITY_UNAVAILABLE",
+            "Credential target operations require the production environment.",
+        )
+    return environment_id
+
+
+def _credential_gateway_preflight(args, state, *, reset=False):
     base_url = resolve_base_url(args, state)
     manifest = cua_auth.authorized_manifest(state, base_url, timeout=30)
     capabilities = manifest.get("capabilities") if isinstance(manifest.get("capabilities"), dict) else {}
@@ -711,13 +854,15 @@ def _credential_gateway_preflight(args, state, *, browser=False, reset=False):
     payload = {"desktop_id": args.desktop_id} if getattr(args, "desktop_id", None) else {}
     target = _credential_tool(args, state, "cua_credential_capabilities", payload, timeout=30)
     if target.get("adapter_protocol") != CREDENTIAL_TARGET_PROTOCOL or target.get("transport") != "access_hub_gateway":
-        raise SkillError("TARGET_CAPABILITY_UNAVAILABLE", "Gateway does not advertise the production CUA Target Adapter v1.")
-    required = {"reset-e2e-v1"} if reset else (CREDENTIAL_BROWSER_FEATURES if browser else CREDENTIAL_DEVICE_FEATURES)
+        raise SkillError("TARGET_CAPABILITY_UNAVAILABLE", "Gateway does not advertise the isolated CUA Target Adapter v1.")
+    if target.get("environment_id") != "prod":
+        raise SkillError("TARGET_CAPABILITY_UNAVAILABLE", "Gateway does not advertise the production Credential environment.")
+    required = {"reset-e2e-v1"} if reset else CREDENTIAL_DEVICE_FEATURES
     missing_features = sorted(required - set(target.get("features") or []))
     if missing_features:
         raise SkillError(
             "TARGET_CAPABILITY_UNAVAILABLE",
-            "Production CUA target is missing required Credential features.",
+            "The selected CUA target is missing required Credential features.",
             missing_features=missing_features,
         )
     return target
@@ -734,8 +879,8 @@ def _safe_agent_path(value):
     if (
         not stat.S_ISREG(info.st_mode)
         or stat.S_ISLNK(info.st_mode)
-        or info.st_mode & 0o022
-        or not os.access(path, os.X_OK)
+        or (os.name != "nt" and info.st_mode & 0o022)
+        or (os.name != "nt" and not os.access(path, os.X_OK))
     ):
         raise SkillError(
             "TARGET_AGENT_UNAVAILABLE",
@@ -814,7 +959,7 @@ def _finish_local_relay(process, events, deadline):
     return str(device.get("id") or "").strip() if isinstance(device, dict) else ""
 
 
-def _validate_pair_relay_completion(completed, *, workflow_id, desktop_id, approved_device_id):
+def _validate_pair_relay_completion(completed, *, workflow_id, desktop_id):
     completed_workflow_id = str(completed.get("workflow_id") or "").strip()
     completed_desktop_id = str(completed.get("desktop_id") or "").strip()
     device_id = str(completed.get("device_id") or "").strip()
@@ -822,11 +967,11 @@ def _validate_pair_relay_completion(completed, *, workflow_id, desktop_id, appro
         raise SkillError("TARGET_AGENT_UNAVAILABLE", "Gateway did not return the enrolled target Device ID.")
     if completed_workflow_id != workflow_id or completed_desktop_id != desktop_id:
         raise SkillError("PAIR_RELAY_TARGET_MISMATCH", "Gateway completed enrollment for a different Credential target.")
-    # Pair approval intentionally returns only pending target metadata. Its
-    # Device ID remains empty until the target completes enrollment, so compare
-    # IDs only when the identity service actually supplied one at approval.
-    if approved_device_id and approved_device_id != device_id:
-        raise SkillError("PAIR_RELAY_TARGET_MISMATCH", "Target enrollment did not match the approved CUA device.")
+    # The local approval result identifies the authenticated control device
+    # that approved this operation. The completion result identifies the newly
+    # enrolled cloud-desktop device, so those cross-role IDs must not be
+    # compared. Target identity remains bound by the encrypted pair operation,
+    # exact resource binding, workflow ID, and desktop ID checked above.
     return device_id
 
 
@@ -841,7 +986,10 @@ def _credential_begin_once(args, state, request_id):
 
 
 def _credential_begin_with_expiry_recovery(args, state, session):
-    request_id = session.credential_begin_request(args.desktop_id, args.mode)
+    environment_id = _credential_runtime_environment()
+    request_id = session.credential_begin_request(
+        environment_id, args.desktop_id, args.mode
+    )
     try:
         return _credential_begin_once(args, state, request_id), request_id
     except SkillError as exc:
@@ -851,9 +999,25 @@ def _credential_begin_with_expiry_recovery(args, state, session):
         ):
             raise
     request_id = session.renew_expired_credential_begin_request(
-        args.desktop_id, args.mode, request_id
+        environment_id, args.desktop_id, args.mode, request_id
     )
     return _credential_begin_once(args, state, request_id), request_id
+
+
+def _credential_workflow_readiness(args, state, workflow_id, current):
+    health = _credential_tool(
+        args,
+        state,
+        "cua_credential_health",
+        {"workflow_id": workflow_id},
+        timeout=max(1, min(30, args.timeout_seconds)),
+    )
+    updated = dict(current)
+    updated["device_ready"] = health.get("device_ready") is True
+    browser_ready = health.get("browser_ready") is True
+    updated["browser_connected"] = browser_ready
+    updated["browser_extension_ready"] = browser_ready
+    return updated
 
 
 def cmd_credential_target_capabilities(args, state, session):
@@ -917,7 +1081,7 @@ def cmd_credential_target_begin(args, state, session):
             process.stdin.write(json.dumps(envelope, separators=(",", ":")) + "\n")
             process.stdin.close()
             process.stdin = None
-            approved_device_id = _finish_local_relay(process, events, deadline)
+            _finish_local_relay(process, events, deadline)
             process = None
             completed = cua_auth.authorized_private_call(
                 state,
@@ -930,7 +1094,6 @@ def cmd_credential_target_begin(args, state, session):
                 completed,
                 workflow_id=workflow_id,
                 desktop_id=str(data.get("desktop_id") or "").strip(),
-                approved_device_id=approved_device_id,
             )
             data = completed
 
@@ -944,12 +1107,18 @@ def cmd_credential_target_begin(args, state, session):
                 code = "BROWSER_SETUP_REQUIRED" if device_ready else "OPERATION_IN_PROGRESS"
                 raise SkillError(code, "Credential target preparation did not finish within the bounded wait.")
             time.sleep(min(CREDENTIAL_PAIR_POLL_INTERVAL_SEC, deadline - time.monotonic()))
-            data = _credential_begin_once(args, state, request_id)
+            data = _credential_workflow_readiness(args, state, workflow_id, data)
 
         device_id = str(data.get("device_id") or "").strip()
         if not device_id:
             raise SkillError("TARGET_AGENT_UNAVAILABLE", "Gateway did not return the exact enrolled Device ID.")
-        session.complete_credential_begin(args.desktop_id, args.mode, workflow_id, device_id)
+        session.complete_credential_begin(
+            _credential_runtime_environment(),
+            args.desktop_id,
+            args.mode,
+            workflow_id,
+            device_id,
+        )
         emit_target_success("begin", {
             "workflow_id": workflow_id,
             "desktop_id": data.get("desktop_id"),
@@ -984,7 +1153,9 @@ def cmd_credential_target_authorize_begin(args, state, session):
     operation_id = str(data.get("operation_id") or "").strip()
     if not operation_id:
         raise SkillError("TARGET_AGENT_UNAVAILABLE", "Gateway did not return an HTTPS capability observation.")
-    session.remember_credential_operation(operation_id, args.workflow_id)
+    session.remember_credential_operation(
+        _credential_runtime_environment(), operation_id, args.workflow_id
+    )
     emit_target_success("browser-authorize-begin", {
         "operation_id": operation_id,
         "status": data.get("status") or "running",
@@ -993,7 +1164,9 @@ def cmd_credential_target_authorize_begin(args, state, session):
 
 
 def cmd_credential_target_authorize_watch(args, state, session):
-    workflow_id = session.workflow_for_credential_operation(args.operation_id)
+    workflow_id = session.workflow_for_credential_operation(
+        _credential_runtime_environment(), args.operation_id
+    )
     if not workflow_id:
         raise SkillError("WORKFLOW_EXPIRED", "HTTPS capability observation is not bound to an active local workflow.")
     deadline = time.monotonic() + args.timeout_seconds
@@ -1029,7 +1202,9 @@ def cmd_credential_target_network_ensure(args, state, session):
 
 def cmd_credential_target_finish(args, state, session):
     data = _credential_tool(args, state, "cua_credential_finish", {"workflow_id": args.workflow_id}, timeout=args.timeout_seconds)
-    session.finish_credential_workflow(args.workflow_id)
+    session.finish_credential_workflow(
+        _credential_runtime_environment(), args.workflow_id
+    )
     emit_target_success("finish", {
         "workflow_id": args.workflow_id,
         "finished": data.get("finished") is True,
@@ -1038,14 +1213,19 @@ def cmd_credential_target_finish(args, state, session):
 
 
 def cmd_credential_target_reset(args, state, session):
-    request_id = session.credential_reset_request(args.desktop_id, args.device_id)
+    environment_id = _credential_runtime_environment()
+    request_id = session.credential_reset_request(
+        environment_id, args.desktop_id, args.device_id
+    )
     data = _credential_tool(args, state, "cua_credential_reset", {
         "desktop_id": args.desktop_id,
         "device_id": args.device_id,
         "request_id": request_id,
     }, timeout=args.timeout_seconds)
     if data.get("pair_ready") is True:
-        session.finish_credential_reset(args.desktop_id, args.device_id)
+        session.finish_credential_reset(
+            environment_id, args.desktop_id, args.device_id
+        )
     emit_target_success("reset", {
         "desktop_id": data.get("desktop_id") or args.desktop_id,
         "device_id": data.get("device_id") or args.device_id,
@@ -1062,22 +1242,65 @@ def _credential_agent_default():
     return Path.home() / ".local" / "bin" / "credential-agent"
 
 
-def _dependency_config():
-    config = bundled_config()
-    dependency = config.get("credential_skill")
-    if isinstance(dependency, dict):
-        merged = dict(dependency)
-        for key in ("credential_skill_dir", "credential_skill_repository", "credential_skill_commit"):
-            if config.get(key) and key not in merged:
-                merged[key] = config[key]
-        return merged
-    return config
+def _ensure_credential_agent_installed(args, environment):
+    requested = Path(args.agent_path).expanduser() if args.agent_path else _credential_agent_default()
+    if not requested.is_absolute():
+        raise SkillError("TARGET_AGENT_UNAVAILABLE", "Credential Agent install path must be absolute.")
+    try:
+        requested.lstat()
+    except FileNotFoundError:
+        command = [
+            sys.executable,
+            str(CREDENTIAL_RUNTIME / "scripts" / "bootstrap-agent.py"),
+        ]
+        if args.agent_path:
+            command.extend(["--install-path", str(requested)])
+        try:
+            completed = subprocess.run(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=min(args.timeout_seconds, 240),
+                check=False,
+                env=environment,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise SkillError("UPSTREAM_TIMEOUT", "Signed Credential Agent installation timed out.") from exc
+        if completed.returncode:
+            raise SkillError("AGENT_INSTALL_FAILED", "Signed Credential Agent installation did not complete.")
+        agent = _safe_agent_path(requested)
+        return {"agent_path": str(agent), "agent_installed": True}
+    except OSError as exc:
+        raise SkillError("TARGET_AGENT_UNAVAILABLE", "Credential Agent install path cannot be inspected.") from exc
+    agent = _safe_agent_path(requested)
+    return {"agent_path": str(agent), "agent_installed": False}
 
 
-def _credential_subprocess_env(args):
+def _credential_subprocess_env(args, profile=None, environment_id=None):
     environment = os.environ.copy()
     if getattr(args, "api_base_url", None):
         environment["AP_CUA_SKILL_API_BASE_URL"] = _validate_base_url(args.api_base_url)
+    selected = environment_id or (profile or {}).get("environment_id")
+    if selected:
+        if selected != "prod":
+            raise SkillError("UPSTREAM_PROTOCOL_ERROR", "Credential environment is invalid.")
+        environment["CREDENTIAL_AGENT_AUTH_MODE"] = "agentplan_device"
+        environment["CREDENTIAL_AGENT_ENVIRONMENT_ID"] = selected
+    if profile:
+        mapping = {
+            "control_url": "CREDENTIAL_AGENT_CONTROL_URL",
+            "vault_url": "CREDENTIAL_AGENT_VAULT_URL",
+            "policy_authority_id": "CREDENTIAL_AGENT_POLICY_AUTHORITY_ID",
+            "policy_signing_key_id": "CREDENTIAL_AGENT_POLICY_SIGNING_KEY_ID",
+            "policy_signing_public_key": "CREDENTIAL_AGENT_POLICY_SIGNING_PUBLIC_KEY",
+        }
+        for key, name in mapping.items():
+            value = profile.get(key)
+            if not isinstance(value, str) or not value.strip():
+                raise SkillError("UPSTREAM_PROTOCOL_ERROR", "Credential bootstrap profile is incomplete.")
+            environment[name] = value.strip()
     return environment
 
 
@@ -1117,7 +1340,7 @@ def _run_credential_script(command, timeout_seconds, *, environment=None):
     return result
 
 
-def _run_local_target(args, command, timeout_seconds):
+def _run_local_target(args, command, timeout_seconds, *, environment=None):
     invocation = [sys.executable, str(Path(__file__).resolve())]
     if getattr(args, "api_base_url", None):
         invocation.extend(["--api-base-url", args.api_base_url])
@@ -1131,6 +1354,7 @@ def _run_local_target(args, command, timeout_seconds):
             text=True,
             timeout=timeout_seconds,
             check=False,
+            env=environment,
         )
     except subprocess.TimeoutExpired as exc:
         raise SkillError("UPSTREAM_TIMEOUT", "Credential target operation exceeded its bounded client wait.") from exc
@@ -1156,14 +1380,139 @@ def _run_local_target(args, command, timeout_seconds):
     return data
 
 
+def _agent_json(command, *, environment, timeout_seconds):
+    try:
+        completed = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+            env=environment,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise SkillError("UPSTREAM_TIMEOUT", "Credential Agent command timed out.") from exc
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise SkillError("UPSTREAM_PROTOCOL_ERROR", "Credential Agent returned invalid structured output.") from exc
+    if completed.returncode or not isinstance(payload, dict):
+        raise SkillError("TARGET_AGENT_UNAVAILABLE", "Credential Agent command did not complete.")
+    return payload
+
+
+def _validate_bootstrap_profile(payload, expected_environment, expected_proof, expected_operation):
+    profile = payload.get("profile") if isinstance(payload.get("profile"), dict) else {}
+    if (
+        payload.get("proof_jkt") != expected_proof
+        or payload.get("device_role") != "control"
+        or payload.get("operation_id") != expected_operation
+        or profile.get("auth_mode") != "agentplan_device"
+        or profile.get("environment_id") != expected_environment
+    ):
+        raise SkillError("UPSTREAM_PROTOCOL_ERROR", "Credential bootstrap binding is invalid.")
+    for key in ("control_url", "vault_url"):
+        value = str(profile.get(key) or "").strip()
+        parsed = urllib.parse.urlsplit(value)
+        if parsed.scheme != "https" or not parsed.netloc or parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment or parsed.path not in ("", "/"):
+            raise SkillError("UPSTREAM_PROTOCOL_ERROR", "Credential bootstrap service origin is invalid.")
+    for key in ("policy_authority_id", "policy_signing_key_id"):
+        value = str(profile.get(key) or "").strip()
+        if len(value) < 8 or len(value) > 128 or not all(character.isalnum() or character in "._:-" for character in value):
+            raise SkillError("UPSTREAM_PROTOCOL_ERROR", "Credential bootstrap policy identity is invalid.")
+    encoded = str(profile.get("policy_signing_public_key") or "").strip()
+    try:
+        decoded = base64.b64decode(encoded, validate=True)
+    except Exception as exc:
+        raise SkillError("UPSTREAM_PROTOCOL_ERROR", "Credential bootstrap policy key is invalid.") from exc
+    if len(decoded) != 32 or base64.b64encode(decoded).decode("ascii") != encoded:
+        raise SkillError("UPSTREAM_PROTOCOL_ERROR", "Credential bootstrap policy key is invalid.")
+    assertion = str(payload.get("assertion") or "").strip()
+    if len(assertion) > 65536 or len(assertion.split(".")) != 3:
+        raise SkillError("UPSTREAM_PROTOCOL_ERROR", "Credential bootstrap assertion is invalid.")
+    return dict(profile), assertion
+
+
+def _ensure_source_agent_profile(args, state, agent, target):
+    environment_id = target.get("environment_id")
+    if environment_id != "prod":
+        raise SkillError("TARGET_CAPABILITY_UNAVAILABLE", "Credential environment is unavailable.")
+    environment = _credential_subprocess_env(args, environment_id=environment_id)
+    bootstrap_info = _agent_json(
+        [str(agent), "bootstrap-info", "--environment", environment_id,
+         "--control-url", "", "--vault-url", "", "--role", "control", "--output", "json"],
+        environment=environment,
+        timeout_seconds=30,
+    )
+    proof = str(bootstrap_info.get("proof_jkt") or "").strip()
+    if bootstrap_info.get("environment_id") != environment_id or len(proof) != 43:
+        raise SkillError("UPSTREAM_PROTOCOL_ERROR", "Credential Agent bootstrap identity is invalid.")
+    operation_id = "cred-bootstrap-" + secrets.token_urlsafe(18)
+    idempotency_key = "cred-bootstrap-" + secrets.token_urlsafe(18)
+    bootstrap = cua_auth.authorized_credential_bootstrap(
+        state,
+        resolve_base_url(args, state),
+        {"proof_jkt": proof, "operation_id": operation_id, "idempotency_key": idempotency_key},
+        timeout=60,
+    )
+    profile, assertion = _validate_bootstrap_profile(
+        bootstrap, environment_id, proof, operation_id
+    )
+    environment = _credential_subprocess_env(args, profile=profile)
+    setup_command = [
+        str(agent), "setup", "--role", "personal", "--skip-browser",
+        "--auth-mode", "agentplan_device", "--environment", environment_id,
+        "--control-url", profile["control_url"], "--vault-url", profile["vault_url"],
+        "--policy-authority-id", profile["policy_authority_id"],
+        "--policy-signing-key-id", profile["policy_signing_key_id"],
+        "--policy-signing-public-key", profile["policy_signing_public_key"],
+        "--enrollment-assertion-stdin",
+    ]
+    try:
+        completed = subprocess.run(
+            setup_command,
+            input=assertion + "\n",
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=180,
+            check=False,
+            env=environment,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise SkillError("UPSTREAM_TIMEOUT", "Credential Agent enrollment timed out.") from exc
+    finally:
+        assertion = None
+        bootstrap = None
+    if completed.returncode:
+        raise SkillError("SOURCE_SETUP_FAILED", "Credential Agent did not complete proof-bound enrollment.")
+    capabilities = _agent_json(
+        [str(agent), "capabilities", "--output", "json"],
+        environment=environment,
+        timeout_seconds=30,
+    )
+    enrollment = capabilities.get("enrollment") if isinstance(capabilities.get("enrollment"), dict) else {}
+    if (
+        enrollment.get("valid") is not True
+        or enrollment.get("environment_id") != environment_id
+        or enrollment.get("auth_mode") != "agentplan_device"
+    ):
+        raise SkillError("SOURCE_ENROLLMENT_REQUIRED", "Credential Agent enrollment is not active for the selected environment.")
+    return profile, environment
+
+
 def cmd_credentials_status(args, state, session):
     del session
     target = _credential_gateway_preflight(args, state)
-    dependency = cua_dependency.status(_dependency_config())
     agent_path = _credential_agent_default()
     agent = {"installed": False, "path": str(agent_path)}
     try:
         checked = _safe_agent_path(agent_path)
+        environment = _credential_subprocess_env(
+            args, environment_id=target["environment_id"]
+        )
         completed = subprocess.run(
             [str(checked), "capabilities", "--output", "json"],
             stdin=subprocess.DEVNULL,
@@ -1172,6 +1521,7 @@ def cmd_credentials_status(args, state, session):
             text=True,
             timeout=30,
             check=False,
+            env=environment,
         )
         capabilities = json.loads(completed.stdout) if completed.returncode == 0 else {}
         enrollment = capabilities.get("enrollment") if isinstance(capabilities.get("enrollment"), dict) else {}
@@ -1179,108 +1529,104 @@ def cmd_credentials_status(args, state, session):
         agent = {
             "installed": True,
             "path": str(checked),
-            "enrollment_valid": enrollment.get("valid") is True,
+            "enrollment_valid": (
+                enrollment.get("valid") is True
+                and enrollment.get("auth_mode") == "agentplan_device"
+                and enrollment.get("environment_id") == target["environment_id"]
+            ),
+            "environment_id": target["environment_id"],
             "browser_connected": browser.get("connected") is True,
         }
     except (SkillError, ValueError, subprocess.TimeoutExpired):
         pass
-    return {"data": {"dependency": dependency, "source_agent": agent, "target": target}}
+    return {"data": {
+        "runtime": {
+            "embedded": True,
+            "adapter_protocol": CREDENTIAL_TARGET_PROTOCOL,
+        },
+        "source_agent": agent,
+        "target": target,
+    }}
 
 
 def cmd_credentials_setup(args, state, session):
     del session
-    _credential_gateway_preflight(args, state, browser=not args.skip_browser)
-    runtime = cua_dependency.ensure(_dependency_config())
+    target_capabilities = _credential_gateway_preflight(args, state)
+    base_environment = _credential_subprocess_env(
+        args, environment_id=target_capabilities["environment_id"]
+    )
+    installed = _ensure_credential_agent_installed(args, base_environment)
+    agent = _safe_agent_path(installed.get("agent_path"))
+    _profile, environment = _ensure_source_agent_profile(
+        args, state, agent, target_capabilities
+    )
     command = [
-        sys.executable, str(runtime / "scripts" / "prepare-source.py"),
+        sys.executable,
+        str(CREDENTIAL_RUNTIME / "scripts" / "prepare-source.py"),
+        "--agent-path", str(agent),
         "--timeout-seconds", str(args.timeout_seconds),
     ]
-    if args.agent_path:
-        command.extend(["--agent-path", args.agent_path])
-    if args.skip_browser:
-        command.append("--skip-browser")
-    environment = _credential_subprocess_env(args)
-    result = _run_credential_script(command, args.timeout_seconds + 15, environment=environment)
-    agent = _safe_agent_path(result.get("agent_path"))
-    mode = "device" if args.skip_browser else "browser"
+    command.append("--skip-browser")
+    _run_credential_script(command, args.timeout_seconds + 15, environment=environment)
     begin = [
-        "begin", "--mode", mode, "--agent-path", str(agent),
+        "begin", "--mode", "device", "--agent-path", str(agent),
         "--timeout-seconds", str(args.timeout_seconds),
     ]
     if args.desktop_id:
         begin.extend(["--desktop-id", args.desktop_id])
-    target = _run_local_target(args, begin, args.timeout_seconds + 15)
+    target = _run_local_target(
+        args, begin, args.timeout_seconds + 15, environment=environment
+    )
     workflow_id = str(target.get("workflow_id") or "").strip()
     if not workflow_id or target.get("device_ready") is not True:
         raise SkillError("UPSTREAM_PROTOCOL_ERROR", "Credential target setup did not return an exact ready workflow.")
-    setup_error = None
-    try:
-        browser_ready = target.get("browser_extension_ready") is True and target.get("browser_connected") is True
-        if not args.skip_browser and not browser_ready:
-            raise SkillError("BROWSER_SETUP_REQUIRED", "Credential target browser did not become ready.")
-    except Exception as exc:
-        setup_error = exc
-        raise
-    finally:
-        try:
-            _run_local_target(args, [
-                "finish", "--workflow-id", workflow_id,
-                "--timeout-seconds", str(min(args.timeout_seconds, 60)),
-            ], min(args.timeout_seconds, 60) + 10)
-        except SkillError:
-            if setup_error is None:
-                raise
+    browser_ready = target.get("browser_extension_ready") is True and target.get("browser_connected") is True
+    _run_local_target(args, [
+        "finish", "--workflow-id", workflow_id,
+        "--timeout-seconds", str(min(args.timeout_seconds, 60)),
+    ], min(args.timeout_seconds, 60) + 10, environment=environment)
     return {"data": {
         "status": "succeeded",
         "desktop_id": target.get("desktop_id"),
         "device_id": target.get("device_id"),
         "device_ready": target.get("device_ready") is True,
         "browser_ready": browser_ready,
-        "agent_installed": result.get("agent_installed") is True,
-        "dependency": {"installed": True, "compatible": True, "adapter_protocol": CREDENTIAL_TARGET_PROTOCOL},
+        "agent_installed": installed.get("agent_installed") is True,
+        "environment_id": target_capabilities["environment_id"],
+        "runtime": {
+            "embedded": True,
+            "adapter_protocol": CREDENTIAL_TARGET_PROTOCOL,
+        },
     }}
 
 
-def _credential_runtime_and_agent(args, state, *, browser):
-    _credential_gateway_preflight(args, state, browser=browser)
-    runtime = cua_dependency.ensure(_dependency_config())
-    command = [
-        sys.executable, str(runtime / "scripts" / "prepare-source.py"),
-        "--timeout-seconds", str(args.timeout_seconds),
-    ]
-    if args.agent_path:
-        command.extend(["--agent-path", args.agent_path])
-    if not browser:
-        command.append("--skip-browser")
-    prepared = _run_credential_script(
-        command, args.timeout_seconds + 15, environment=_credential_subprocess_env(args)
+def _credential_runtime_and_agent(args, state):
+    target = _credential_gateway_preflight(args, state)
+    base_environment = _credential_subprocess_env(
+        args, environment_id=target["environment_id"]
     )
-    agent = _safe_agent_path(prepared.get("agent_path"))
-    return runtime, agent, prepared
-
-
-def cmd_credentials_sync_browser(args, state, session):
-    del session
-    runtime, agent, _prepared = _credential_runtime_and_agent(args, state, browser=True)
+    installed = _ensure_credential_agent_installed(args, base_environment)
+    agent = _safe_agent_path(installed.get("agent_path"))
+    _profile, environment = _ensure_source_agent_profile(args, state, agent, target)
     command = [
-        sys.executable, str(runtime / "scripts" / "sync-cua.py"),
+        sys.executable,
+        str(CREDENTIAL_RUNTIME / "scripts" / "prepare-source.py"),
         "--agent-path", str(agent),
-        "--target-adapter", str(Path(__file__).resolve()),
-        "--desktop-id", args.desktop_id,
         "--timeout-seconds", str(args.timeout_seconds),
-        *args.site,
     ]
-    result = _run_credential_script(
-        command, args.timeout_seconds + 20, environment=_credential_subprocess_env(args)
+    command.append("--skip-browser")
+    prepared = _run_credential_script(
+        command, args.timeout_seconds + 15, environment=environment
     )
-    return {"data": result}
+    return agent, prepared, environment
 
 
 def cmd_credentials_sync_resource(args, state, session):
     del session
-    runtime, agent, _prepared = _credential_runtime_and_agent(args, state, browser=False)
+    agent, _prepared, environment = _credential_runtime_and_agent(args, state)
     command = [
-        sys.executable, str(runtime / "scripts" / "sync-cua-resource.py"),
+        sys.executable,
+        str(CREDENTIAL_RUNTIME / "scripts" / "sync-cua-resource.py"),
         "--agent-path", str(agent),
         "--target-adapter", str(Path(__file__).resolve()),
         "--desktop-id", args.desktop_id,
@@ -1294,37 +1640,42 @@ def cmd_credentials_sync_resource(args, state, session):
     else:
         command.extend(["--profile", args.profile])
     result = _run_credential_script(
-        command, args.timeout_seconds + 20, environment=_credential_subprocess_env(args)
+        command, args.timeout_seconds + 20, environment=environment
     )
     return {"data": result}
 
 
 def cmd_credentials_reset(args, state, session):
-    _credential_gateway_preflight(args, state, reset=True)
-    runtime = cua_dependency.ensure(_dependency_config())
-    command = [
-        sys.executable, str(runtime / "scripts" / "prepare-source.py"),
-        "--timeout-seconds", str(args.timeout_seconds), "--skip-browser",
-    ]
-    if args.agent_path:
-        command.extend(["--agent-path", args.agent_path])
-    prepared = _run_credential_script(
-        command, args.timeout_seconds + 15, environment=_credential_subprocess_env(args)
+    target = _credential_gateway_preflight(args, state, reset=True)
+    base_environment = _credential_subprocess_env(
+        args, environment_id=target["environment_id"]
     )
-    agent = _safe_agent_path(prepared.get("agent_path"))
-    device_id = str(args.device_id or session.credential_device(args.desktop_id) or "").strip()
+    installed = _ensure_credential_agent_installed(args, base_environment)
+    agent = _safe_agent_path(installed.get("agent_path"))
+    _profile, environment = _ensure_source_agent_profile(args, state, agent, target)
+    environment_id = target["environment_id"]
+    device_id = str(
+        args.device_id
+        or session.credential_device(environment_id, args.desktop_id)
+        or ""
+    ).strip()
     if not device_id:
         raise SkillError("VALIDATION_ERROR", "Pass the exact --device-id because no prior target Device ID is recorded.")
-    request_id = session.credential_reset_request(args.desktop_id, device_id)
-    if not session.credential_reset_central_revoked(args.desktop_id, device_id):
+    request_id = session.credential_reset_request(
+        environment_id, args.desktop_id, device_id
+    )
+    if not session.credential_reset_central_revoked(
+        environment_id, args.desktop_id, device_id
+    ):
         revoked = subprocess.run(
-            [str(agent), "device", "revoke", "--yes", "--output", "json", "--reason", "reset production CUA credential target", device_id],
+            [str(agent), "device", "revoke", "--yes", "--output", "json", "--reason", "reset isolated CUA credential target", device_id],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
             timeout=min(args.timeout_seconds, 120),
             check=False,
+            env=environment,
         )
         if revoked.returncode:
             raise SkillError("UPSTREAM_FAILURE", "Central Device revocation was not confirmed; target reset was not attempted.")
@@ -1335,13 +1686,15 @@ def cmd_credentials_reset(args, state, session):
         revoked_device = revoked_result.get("device") if isinstance(revoked_result.get("device"), dict) else {}
         if revoked_result.get("status") != "revoked" or str(revoked_device.get("id") or "") != device_id:
             raise SkillError("UPSTREAM_FAILURE", "Central Device revocation did not confirm the exact target Device ID.")
-        session.mark_credential_reset_central_revoked(args.desktop_id, device_id)
+        session.mark_credential_reset_central_revoked(
+            environment_id, args.desktop_id, device_id
+        )
     data = _credential_tool(args, state, "cua_credential_reset", {
         "desktop_id": args.desktop_id, "device_id": device_id, "request_id": request_id,
     }, timeout=args.timeout_seconds)
     if data.get("pair_ready") is not True:
         raise SkillError("UPSTREAM_FAILURE", "Target reset did not reach pair_ready.")
-    session.finish_credential_reset(args.desktop_id, device_id)
+    session.finish_credential_reset(environment_id, args.desktop_id, device_id)
     return {"data": {
         "status": "succeeded",
         "desktop_id": args.desktop_id,
@@ -1397,19 +1750,19 @@ def _task_result(action, envelope, session):
 def _next_for_task(envelope):
     outcome = envelope.get("outcome")
     task_id = envelope.get("invocation_id")
-    script = script_path()
+    command = command_prefix()
     next_action = envelope.get("next_action") or {}
     hint = next_action.get("agent_hint", "")
     if outcome == "in_progress":
         return {
-            "command": f"python3 {script} task status --task-id {task_id}",
+            "command": f"{command} task status --task-id {task_id}",
             "agent_hint": hint or "Keep checking task status until completed, needs_input, failed, or cancelled. "
-            f"For a hands-off wait use `python3 {script} task result --task-id {task_id}`. "
+            f"For a hands-off wait use `{command} task result --task-id {task_id}`. "
             "Do not answer the task from progress.",
         }
     if outcome == "needs_input":
         return {
-            "command": f'python3 {script} task answer --task-id {task_id} --answer "<USER_ANSWER>"',
+            "command": f'{command} task answer --task-id {task_id} --answer "<USER_ANSWER>"',
             "agent_hint": hint or "Relay input_request.question to the user verbatim, "
             "then submit their reply with task answer.",
         }
@@ -1542,19 +1895,19 @@ def _envelope_result(action, envelope, session):
 def _next_for_envelope(envelope):
     outcome = envelope.get("outcome")
     invocation_id = envelope.get("invocation_id")
-    script = script_path()
+    command = command_prefix()
     next_action = envelope.get("next_action") or {}
     hint = next_action.get("agent_hint", "")
     if outcome == "in_progress":
         return {
-            "command": f"python3 {script} watch --invocation-id {invocation_id}",
+            "command": f"{command} watch --invocation-id {invocation_id}",
             "agent_hint": hint or "Keep watching until completed, needs_input, failed, or cancelled. "
             "Each watch returns quickly; just call it again while in_progress. For a hands-off wait, "
-            f"use `python3 {script} result --invocation-id {invocation_id}`. Do not answer the task from progress.",
+            f"use `{command} result --invocation-id {invocation_id}`. Do not answer the task from progress.",
         }
     if outcome == "needs_input":
         return {
-            "command": f'python3 {script} answer --invocation-id {invocation_id} --answer "<USER_ANSWER>"',
+            "command": f'{command} answer --invocation-id {invocation_id} --answer "<USER_ANSWER>"',
             "agent_hint": hint or "Relay input_request.question to the user verbatim, "
             "then submit their reply with answer.",
         }
@@ -1580,14 +1933,16 @@ def _derive_desktop_urls(access_url):
         return None, None
 
     path = parts.path or "/"
-    segments = path.split("/")
+    segments = [segment for segment in path.split("/") if segment]
     try:
-        desktop_index = segments.index("desktops")
+        desktops_index = segments.index("desktops")
     except ValueError:
-        desktop_index = -1
-    if desktop_index >= 0 and len(segments) > desktop_index + 1 and segments[desktop_index + 1]:
-        desktop_prefix = "/".join(segments[: desktop_index + 2])
-        scope_kind = segments[desktop_index + 2] if len(segments) > desktop_index + 2 else ""
+        desktops_index = -1
+    if desktops_index >= 0 and len(segments) > desktops_index + 1:
+        public_prefix = "/" + "/".join(segments[:desktops_index]) if desktops_index else ""
+        desktop_id = segments[desktops_index + 1]
+        desktop_prefix = f"{public_prefix}/desktops/{desktop_id}"
+        scope_kind = segments[desktops_index + 2] if len(segments) > desktops_index + 2 else ""
         if scope_kind == "cua-app":
             return None, access_url
         full_path = desktop_prefix + "/cua-app/"
@@ -1624,8 +1979,16 @@ def build_parser():
     p = auth.add_parser("status", help="Check the current login state.")
     p.set_defaults(handler=cmd_auth_status, action="auth status")
 
-    p = auth.add_parser("login", help="Use arkcli or the hidden local credential prompt.")
-    p.add_argument("--no-prompt", action="store_true", help="Do not prompt; require an arkcli credential.")
+    p = auth.add_parser("login", help="Use arkcli by default or explicitly select the hidden manual prompt.")
+    login_mode = p.add_mutually_exclusive_group()
+    login_mode.add_argument(
+        "--no-prompt", action="store_true", help="Do not prompt; require an arkcli credential."
+    )
+    login_mode.add_argument(
+        "--manual",
+        action="store_true",
+        help="Bypass arkcli and securely prompt for an API key in this local terminal.",
+    )
     p.set_defaults(handler=cmd_auth_login, action="auth login")
 
     p = auth.add_parser("logout", help="Clear the locally cached AgentPlan API key.")
@@ -1691,6 +2054,7 @@ def _add_semantic_parsers(sub):
     p.set_defaults(handler=cmd_desktop_list, action="desktop list")
 
     p = desktop.add_parser("access", help="Get a temporary CUA App login URL.")
+    p.add_argument("--desktop", help="Exact owned desktop id; omit to use the selected desktop.")
     p.set_defaults(handler=cmd_desktop_access, action="desktop access")
 
     p = desktop.add_parser("revoke-access", help="Revoke a temporary CUA App access ticket.")
@@ -1698,6 +2062,43 @@ def _add_semantic_parsers(sub):
     group.add_argument("--ticket", help="Ticket returned by desktop access.")
     group.add_argument("--access-url", help="CUA App URL containing the ticket query parameter.")
     p.set_defaults(handler=cmd_desktop_revoke_access, action="desktop revoke-access")
+
+    p = desktop.add_parser(
+        "start",
+        help="Ensure a desktop is ready by reusing, starting, recovering, or allocating it.",
+    )
+    p.add_argument(
+        "--desktop",
+        help="Exact caller-owned desktop id to recover or start. Omit to let the service select the primary desktop or allocate one.",
+    )
+    p.add_argument(
+        "--idempotency-key",
+        required=True,
+        help="Stable unique key for this user-requested start; reuse it when retrying the same request.",
+    )
+    p.set_defaults(handler=cmd_desktop_start, action="desktop start")
+
+    p = desktop.add_parser(
+        "shutdown",
+        help="Release the desktop to stop billing, revoke access, and stop or delete it.",
+    )
+    p.add_argument("--desktop", help="Optional exact caller-owned desktop id.")
+    p.add_argument(
+        "--confirm",
+        action="store_true",
+        required=True,
+        help="Confirm that the user explicitly requested shutdown and understands active tasks stop.",
+    )
+    p.add_argument(
+        "--idempotency-key",
+        required=True,
+        help="Stable unique key for this user-approved shutdown; reuse it when retrying the same request.",
+    )
+    p.set_defaults(handler=cmd_desktop_shutdown, action="desktop shutdown")
+
+    p = desktop.add_parser("operation", help="Check a desktop start or shutdown operation.")
+    p.add_argument("--operation-id", required=True, help="Operation id returned by desktop start or shutdown.")
+    p.set_defaults(handler=cmd_desktop_operation, action="desktop operation")
 
 
     model = sub.add_parser("model", help="Read the default CUA model config.").add_subparsers(dest="model_command")
@@ -1799,31 +2200,47 @@ def _add_semantic_parsers(sub):
 
 
 def _add_credential_parsers(sub):
+    p = sub.add_parser("browser-sync", help="Check browser login sync for desktops, joining a desktop to the connection this computer's extension uploads to; with --cdp-url, first configure local CookieCloud.")
+    p.add_argument("--desktop-id", action="append", help="Exact authorized CUA desktop id; repeat for several desktops of the same owner.")
+    p.add_argument("--all-desktops", action="store_true", help="Instead of --desktop-id, use every ready desktop this login lists.")
+    p.add_argument("--domain", action="append", required=True, help="User-selected full website domain; repeat for multiple sites.")
+    p.add_argument("--cdp-url", help="User-authorized local Chrome debugging HTTP or WebSocket URL; needed only to configure or change the extension.")
+    p.add_argument("--with-storage", action="store_true", help="With --cdp-url, also sync Local Storage for websites whose login needs it.")
+    p.add_argument("--confirm-domains", action="store_true", help="With --cdp-url, use only after the user confirms narrowing an all-websites local list.")
+    p.add_argument("--confirm-desktop-switch", action="store_true", help="With --cdp-url, use only after the user confirms moving the extension from another connection.")
+    p.add_argument("--wait-seconds", type=int, default=0, help="Without --cdp-url, wait up to this many seconds (max 300, shared by all desktops) for a new upload to be imported or rejected.")
+    p.add_argument("--timeout-seconds", type=int, default=90)
+    p.set_defaults(action="browser-sync", handler=cmd_browser_sync)
+
+    p = sub.add_parser("browser-sync-leave", help="Stop one desktop's browser login sync; the connection's other desktops keep receiving uploads.")
+    p.add_argument("--desktop-id", required=True, help="Exact authorized CUA desktop id.")
+    p.set_defaults(action="browser-sync-leave", handler=cmd_browser_sync_leave)
+
+    p = sub.add_parser("browser-sync-revoke", help="Revoke the browser sync connection for every desktop that shares it.")
+    p.add_argument("--desktop-id", required=True, help="Exact authorized CUA desktop id in the connection.")
+    p.add_argument("--confirm", action="store_true", required=True,
+                   help="Confirm that the user explicitly asked to revoke browser sync for every desktop of this connection.")
+    p.set_defaults(action="browser-sync-revoke", handler=cmd_browser_sync_revoke)
+
     credentials = sub.add_parser(
         "credentials",
         help="Prepare, synchronize, diagnose, or reset credentials for an owned CUA.",
     ).add_subparsers(dest="credentials_command")
 
-    p = credentials.add_parser("status", help="Read Credential dependency, source Agent, and target readiness.")
+    p = credentials.add_parser("status", help="Inspect source Agent enrollment and Gateway target capabilities.")
     p.add_argument("--desktop-id")
     p.set_defaults(action="credentials status", handler=cmd_credentials_status)
 
-    p = credentials.add_parser("setup", help="Prepare the source Agent and exact target without creating a model task.")
+    p = credentials.add_parser("setup", help="Prepare Credential Agent devices for non-browser resources.")
     p.add_argument("--desktop-id")
-    p.add_argument("--agent-path")
-    p.add_argument("--skip-browser", action="store_true")
+    p.add_argument("--agent-path", help="Source Agent path for --skip-browser resource setup.")
+    p.add_argument("--skip-browser", action="store_true", required=True, help="Keep browser login sync in browser-sync.")
     p.add_argument("--timeout-seconds", type=int, default=600)
     p.set_defaults(action="credentials setup", handler=cmd_credentials_setup)
 
-    sync = credentials.add_parser("sync", help="Synchronize an explicit browser site or resource.").add_subparsers(
+    sync = credentials.add_parser("sync", help="Deliver named Credential Agent resources.").add_subparsers(
         dest="credentials_sync_command"
     )
-    p = sync.add_parser("browser", help="Sync explicitly named signed HTTPS site policies.")
-    p.add_argument("--desktop-id", required=True)
-    p.add_argument("--agent-path")
-    p.add_argument("--timeout-seconds", type=int, default=420)
-    p.add_argument("site", nargs="+")
-    p.set_defaults(action="credentials sync browser", handler=cmd_credentials_sync_browser)
 
     for resource in ("env", "secret"):
         p = sync.add_parser(resource, help=f"Sync explicitly named {resource} resources.")
@@ -1869,7 +2286,7 @@ def _add_credential_parsers(sub):
 
     credential_target = sub.add_parser(
         "credential-target",
-        help="Internal CUA Target Adapter v1 surface for al-credential-sync.",
+        help="Internal CUA Target Adapter v1 surface for embedded Credential orchestration.",
     ).add_subparsers(dest="credential_target_command")
 
     p = credential_target.add_parser("capabilities")
