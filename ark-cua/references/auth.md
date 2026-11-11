@@ -1,56 +1,45 @@
 # Auth
 
-This AgentPlan CUA skill uses the caller's Volcengine Ark AgentPlan API key as
-the bearer credential. The gateway validates that key with Ark acquire, resolves
-an AgentPlan-only user principal, allocates the user's cloud desktop, and passes
-the same API key to CUA runtime model calls.
+Use the user's existing AgentPlan login. The CLI handles authentication; do not read credential files or ask for API keys in chat.
 
 ## Login
 
-1. A business command (or `auth status`) reuses the protected local credential
-   when present. Otherwise it checks whether `arkcli` is in `PATH`.
-2. If arkcli is installed, the CLI copies only `config.yaml`, legacy
-   `profile.yaml` / `.env`, and the `identities` / `identity_store` directories
-   into a private `0700` temporary HOME. It runs
-   `arkcli profile list --format json` there and selects the first profile whose
-   `type` is exactly `agent-plan` and whose `plan_tier` is exactly `max`. Arkcli
-   then brokers the selected profile credential into a redacted, non-serializable
-   handle. The real arkcli state is not modified, and the temporary snapshot is
-   deleted after discovery.
-3. An arkcli-sourced credential is validated through `/v1/auth/me`, used only in
-   that process, and never copied into the CUA cache. Successful auth output
-   exposes only its source and selected profile metadata.
-4. If arkcli is not installed, has no personal Agent Plan Max profile, has no
-   usable key, or otherwise fails, `AUTH_REQUIRED` includes `arkcli_status`,
-   `arkcli_hint`, and the existing `setup_command`. Ask the user to run that
-   command in their own local terminal; it uses the hidden API-key prompt.
+1. Run `auth status`. The CLI reuses a saved login or an eligible personal AgentPlan Max account from `arkcli` without changing the user's arkcli settings.
+2. On `AUTH_REQUIRED`, follow a recoverable `arkcli_hint` when available. Otherwise ask the user to run the returned `setup_command` in their own terminal and enter the API key through its hidden prompt.
+3. After the user completes login, run `auth status` again. Do not treat a failed login as permission to switch accounts.
 
-When stdin is not a TTY, `auth login` does not prompt or block. It returns
-`AUTH_REQUIRED` with `setup_command` so the agent can ask the user to perform the
-login in a real local terminal instead of pasting the API key into chat.
+## Switch accounts
 
-## Local Cache
+When the user explicitly requests a different account or API key, ask them to run this in their own terminal:
 
-- Location: `~/.openclaw/ark-cua/auth.json` (override with
-  `AP_CUA_SKILL_AUTH_FILE`).
-- Permissions: `0600`; the script attempts to repair unsafe permissions and
-  refuses to continue if it cannot.
-- `auth.json` holds the API base URL and, only for the hidden local-prompt
-  fallback, the protected credential plus last verified user summary and desktop binding
-  flag. arkcli-sourced keys are never copied here. Cache contents are never
-  printed.
+```bash
+python3 scripts/cua.py auth login --manual
+```
+
+The user enters the key through a hidden prompt, not in chat, command arguments or environment variables. This login remains active until `auth logout`. If it is rejected, repeat the returned manual login flow rather than silently using another account.
+
+An agent-run login command returns instructions when it cannot prompt interactively; relay them to the user.
+
+## Environments
+
+The bundled gateway is AgentPlan. Another gateway, such as a development environment, is selected with `--api-base-url <url>` (or `AP_CUA_SKILL_API_BASE_URL`) and needs its own login: ask the user to run the returned `setup_command`, which names that gateway, in their own terminal and enter that environment's API key or token through the hidden prompt. The login is saved for that gateway and later commands use it by default. One login is saved at a time: logging in to another gateway removes the previous one.
+
+A credential is sent only to the gateway it belongs to: a saved login to the gateway it was saved for, and arkcli's AgentPlan key only to the bundled AgentPlan gateway. `AUTH_REQUIRED` with `gateway_login_required=true` means the selected gateway needs its own login (none is saved for it, or it rejected the saved one); never copy a key between environments. `auth logout` removes the saved login and returns later commands to the bundled gateway.
+
+## Real-name verification
+
+If `real_name_verification.status` is `unverified` or an operation returns `VOLCENGINE_REAL_NAME_REQUIRED`, provide `verification_url` and ask the user to complete verification on Volcengine before allocating a new desktop. Then rerun `auth status`. Existing allocated desktops remain usable; this is not an invalid API key.
 
 ## Auth Errors
 
-| Error | Meaning | Action |
-| --- | --- | --- |
-| `AUTH_REQUIRED` | no usable key from existing configuration or arkcli, or the key is invalid | inspect `arkcli_status`; fix arkcli when practical, otherwise ask the user to run fallback `setup_command`, then retry |
-| `AUTH_REQUIRED` with `arkcli_status=state_snapshot_failed` | arkcli state could not be copied into a private temporary HOME | use the local hidden API-key prompt or fix access to the user's arkcli state |
-| `TOKEN_EXPIRED` | gateway rejected the bearer credential | ask the user to run `setup_command` in their own local terminal again |
-| `REFRESH_FAILED` | legacy alias for re-login needed | ask the user to run `setup_command` in their own local terminal again |
-| `FORBIDDEN` | API key is valid but not allowed for this operation | do not retry with the same key |
+| Error | Action |
+| --- | --- |
+| `AUTH_REQUIRED` | Follow the login steps above. When `manual_login_required=true`, use the returned manual `setup_command`; when `gateway_login_required=true`, follow Environments. |
+| `TOKEN_EXPIRED` / `REFRESH_FAILED` | Ask the user to run `setup_command` in their local terminal, then retry after login. |
+| `FORBIDDEN` | Report missing permission; do not retry the same operation with the same key. |
+| `VOLCENGINE_REAL_NAME_REQUIRED` | Follow the verification steps above without replacing a valid login. |
+| `VOLCENGINE_REAL_NAME_CHECK_UNAVAILABLE` | Report the temporary failure; check status before retrying an allocation so a desktop or task is not created twice. |
 
 ## Logout
 
-`auth logout` clears the local cache. There is no server-side refresh token to
-revoke in this AgentPlan variant.
+`auth logout` removes this Skill's saved login and its gateway, so later commands use the bundled AgentPlan gateway. It does not sign out of arkcli, whose account may be reused by later commands.

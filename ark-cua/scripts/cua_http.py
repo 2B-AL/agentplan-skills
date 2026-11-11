@@ -1,3 +1,17 @@
+# Copyright (c) 2025 Beijing Volcano Engine Technology Co., Ltd. and/or its affiliates.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Minimal HTTPS client for the CUA Skill Gateway.
 
 Stdlib only (urllib). Parses the gateway's unified `{ ok, data | error }`
@@ -25,12 +39,16 @@ class _NoRedirect(HTTPRedirectHandler):
 _OPENER = build_opener(_NoRedirect)
 
 
+def _request_headers(accept):
+    return {"accept": accept}
+
+
 def request(method, base_url, path, token=None, body=None, query=None, timeout=DEFAULT_TIMEOUT_SEC):
     """Perform an HTTP request and return (status_code, parsed_json)."""
     url = base_url.rstrip("/") + path
     if query:
         url += "?" + urlencode(query)
-    headers = {"accept": "application/json"}
+    headers = _request_headers("application/json")
     data = None
     if body is not None:
         data = json.dumps(body).encode("utf-8")
@@ -58,7 +76,7 @@ def raw_request(method, base_url, path, token=None, body=None, query=None, timeo
     url = base_url.rstrip("/") + path
     if query:
         url += "?" + urlencode(query)
-    headers = {"accept": "application/octet-stream, */*"}
+    headers = _request_headers("application/octet-stream, */*")
     data = None
     if body is not None:
         data = json.dumps(body).encode("utf-8")
@@ -158,6 +176,17 @@ def gateway_private_call(base_url, token, path, arguments=None, timeout=DEFAULT_
     _raise_gateway_error(status, payload)
 
 
+def gateway_credential_bootstrap(base_url, token, arguments, timeout=DEFAULT_TIMEOUT_SEC):
+    """Mint one proof-bound Agent enrollment assertion on the fixed endpoint."""
+    status, payload = request(
+        "POST", base_url, "/skill/credential-bootstrap", token=token,
+        body=arguments, timeout=timeout,
+    )
+    if 200 <= status < 300 and isinstance(payload, dict):
+        return dict(payload)
+    _raise_gateway_error(status, payload)
+
+
 def _raise_gateway_error(status, payload):
     # Prefer a real gateway error envelope (it carries the authoritative code).
     error = payload.get("error") if isinstance(payload, dict) else None
@@ -182,6 +211,8 @@ def _raise_gateway_error(status, payload):
             "upstream_status",
             "conflict_scope",
             "active_task_id",
+            "action_required",
+            "verification_url",
         }
         extra = {k: v for k, v in error.items() if k in safe_fields}
         if payload.get("request_id") and not extra.get("request_id"):

@@ -1,3 +1,17 @@
+# Copyright (c) 2025 Beijing Volcano Engine Technology Co., Ltd. and/or its affiliates.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Shared helpers for the AgentPlan CUA Skill CLI.
 
 Stdlib only. Provides the unified JSON output contract and a structured error
@@ -7,14 +21,22 @@ contents, or raw artifact bytes.
 
 import json
 import os
+import shlex
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 # Errors that are safe to retry transparently: gateway/upstream timeouts,
 # backend hiccups, rate limits, and local network blips. The CLI keeps polling
 # on these instead of failing a whole task on a single 504.
 RETRYABLE_ERROR_CODES = frozenset(
-    {"GATEWAY_TIMEOUT", "CUA_BACKEND_UNAVAILABLE", "RATE_LIMITED", "NETWORK"}
+    {
+        "GATEWAY_TIMEOUT",
+        "CUA_BACKEND_UNAVAILABLE",
+        "VOLCENGINE_REAL_NAME_CHECK_UNAVAILABLE",
+        "RATE_LIMITED",
+        "NETWORK",
+    }
 )
 
 
@@ -70,7 +92,20 @@ def _next_for_error(body):
         }
     setup = body.get("setup_command")
     if code in ("AUTH_REQUIRED", "REFRESH_FAILED", "TOKEN_EXPIRED") and setup:
-        if body.get("arkcli_status"):
+        if body.get("manual_login_required"):
+            agent_hint = (
+                "The user explicitly selected manual API-key login. Ask them to open a local "
+                "terminal, run setup_command there, and enter the key through the hidden prompt. "
+                "This path intentionally bypasses arkcli. Never ask them to paste the key into chat."
+            )
+        elif body.get("gateway_login_required"):
+            agent_hint = (
+                "The selected gateway is not the bundled AgentPlan gateway and needs its own login; "
+                "credentials of another environment are never sent to it. Ask the user to open a local terminal, "
+                "run setup_command there, and enter that environment's API key or token through the hidden prompt. "
+                "Never ask the user to paste it into chat."
+            )
+        elif body.get("arkcli_status"):
             agent_hint = (
                 "arkcli discovery already ran. Inspect error.arkcli_status and follow error.arkcli_hint first; "
                 "never expose the key. If arkcli is unavailable or cannot be repaired, ask the user to open "
@@ -108,6 +143,13 @@ def _next_for_error(body):
         return {
             "agent_hint": "The model provider timed out. Report error.reason and error.request_id. "
             "Retry only when the operation is safe and the user wants to try again.",
+        }
+    if code == "VOLCENGINE_REAL_NAME_REQUIRED" and body.get("verification_url"):
+        return {
+            "verification_url": body["verification_url"],
+            "agent_hint": "The API key is valid, but this operation would allocate a new CUA. "
+            "Ask the user to complete Volcengine real-name verification at verification_url, "
+            "then run `auth status` and retry. Existing allocated CUA invocations are unaffected.",
         }
     if code in ("DESKTOP_UNHEALTHY", "SESSION_CLEANUP", "UPSTREAM_FAILURE"):
         return {
@@ -149,9 +191,50 @@ def script_path():
     return os.path.abspath(sys.argv[0]) if sys.argv and sys.argv[0] else "scripts/cua.py"
 
 
-def login_setup_command():
-    """The command the user should run in their own local terminal to login."""
-    return f"python3 {script_path()} auth login"
+def command_prefix():
+    return f"python3 {script_path()}"
+
+
+def login_setup_command(manual=False, base_url=None):
+    """The command the user should run in their own local terminal to login.
+
+    A gateway other than the bundled one is named, so the login is saved for it;
+    the bundled AgentPlan gateway keeps the plain command.
+    """
+    suffix = " --manual" if manual else ""
+    named = base_url and not same_gateway(base_url, bundled_base_url())
+    gateway = f" --api-base-url {shlex.quote(base_url)}" if named else ""
+    return f"{command_prefix()}{gateway} auth login{suffix}"
+
+
+def same_gateway(first, second):
+    """Whether two gateway URLs name the same gateway, ignoring spaces and a trailing slash."""
+    first, second = (url.strip().rstrip("/") if isinstance(url, str) else "" for url in (first, second))
+    return bool(first) and first == second
+
+
+def bundled_config():
+    """Read the publisher-controlled, non-secret bundled configuration."""
+    try:
+        cfg_path = Path(__file__).resolve().parent.parent / "assets" / "config.json"
+        if not cfg_path.exists():
+            return {}
+        data = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def bundled_base_url():
+    """Gateway URL shipped as a bundled asset (publisher-set, once): the AgentPlan gateway."""
+    data = bundled_config()
+    url = data.get("api_base_url")
+    if not isinstance(url, str):
+        return None
+    url = url.strip()
+    if not url or url.startswith("<") or "REPLACE" in url or "example.com" in url:
+        return None
+    return url
 
 
 # MIME type -> file extension, for artifact downloads that don't specify a name.
