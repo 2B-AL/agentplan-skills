@@ -22,7 +22,7 @@ An agent-run login command returns instructions when it cannot prompt interactiv
 
 ## Environments
 
-The bundled gateway is AgentPlan. Another gateway, such as a development environment, is selected with `--api-base-url <url>` (or `AP_CUA_SKILL_API_BASE_URL`) and needs its own login: ask the user to run the returned `setup_command`, which names that gateway, in their own terminal and enter that environment's API key or token through the hidden prompt. The login is saved for that gateway and later commands use it by default. One login is saved at a time: logging in to another gateway removes the previous one.
+The bundled gateway is AgentPlan. Another gateway, such as a development environment, is selected with `--api-base-url <url>` (or `AP_CUA_SKILL_API_BASE_URL` / `CUA_SKILL_API_BASE_URL`) and needs its own login: ask the user to run the returned `setup_command`, which names that gateway, in their own terminal and enter that environment's API key or token through the hidden prompt. The login is saved for that gateway and later commands use it by default. One login is saved at a time: logging in to another gateway removes the previous one.
 
 A credential is sent only to the gateway it belongs to: a saved login to the gateway it was saved for, and arkcli's AgentPlan key only to the bundled AgentPlan gateway. `AUTH_REQUIRED` with `gateway_login_required=true` means the selected gateway needs its own login (none is saved for it, or it rejected the saved one); never copy a key between environments. `auth logout` removes the saved login and returns later commands to the bundled gateway.
 

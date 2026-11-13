@@ -1,7 +1,7 @@
 ---
 name: ark-cua
 description: Delegate web and desktop tasks to Volcengine AgentPlan CUA. Supports files, reusable tasks, desktop access and lifecycle, browser login sync with CookieCloud, and named credential resources with Credential Agent. Prefer local reasoning or purpose-built local/API tools when they can complete the request directly.
-version: 1.3.0
+version: 1.3.1
 license: Apache-2.0
 ---
 

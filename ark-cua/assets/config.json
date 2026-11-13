@@ -1,4 +1,4 @@
 {
-  "_comment": "Bundled default AgentPlan CUA Skill Gateway URL. Users can override per-call with --api-base-url or AP_CUA_SKILL_API_BASE_URL, matching ap-cua-skill. Credential orchestration is embedded in this Skill.",
+  "_comment": "Bundled default ARK CUA gateway URL (AgentPlan). Users can override per-call with --api-base-url, AP_CUA_SKILL_API_BASE_URL or CUA_SKILL_API_BASE_URL. Credential orchestration is embedded in this Skill.",
   "api_base_url": "https://s4ebmnro55svp3n2okb3k.apigateway-cn-beijing.volceapi.com"
 }

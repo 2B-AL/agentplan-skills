@@ -1,4 +1,4 @@
-# AgentPlan CUA Skill commands
+# ARK CUA Skill commands
 
 All commands: `python3 <skill_dir>/scripts/cua.py <command> [options]`.
 The CLI uses its bundled service address and the current login.
