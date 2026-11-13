@@ -50,7 +50,7 @@ from cua_util import RETRYABLE_ERROR_CODES, SkillError, bundled_base_url, login_
 
 DEFAULT_LOGIN_TIMEOUT_SEC = 0
 ARKCLI_TIMEOUT_SEC = 20
-ARKCLI_SKILL_NAME = "byted-util-ark-cua"
+ARKCLI_SKILL_NAME = "ark-cua"
 ARKCLI_STATE_FILES = ("config.yaml", "profile.yaml", ".env")
 ARKCLI_STATE_DIRS = ("identities", "identity_store")
 

@@ -173,7 +173,7 @@ def request(url: str, headers: dict[str, str] | None = None) -> Any:
         raise ValueError("download URL must use HTTPS without embedded credentials")
     req = urllib.request.Request(
         url,
-        headers={"User-Agent": "byted-util-ark-cua-credential-bootstrap/1", **(headers or {})},
+        headers={"User-Agent": "ark-cua-credential-bootstrap/1", **(headers or {})},
     )
     return OPENER.open(req, timeout=30)
 
