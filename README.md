@@ -18,9 +18,16 @@ npx -y skills add 2B-AL/cua-skill --skill ark-cua --agent codex claude-code -g -
 ```
 
 In Codex, invoke the installed skill as `$ark-cua`. If an earlier distribution installed
-it as `byted-util-ark-cua`, remove that old skill entry after installing
-`ark-cua` so the agent sees one copy. Keep the runtime state directory described
-below.
+it as `byted-util-ark-cua`, remove it through the installer after installing
+`ark-cua`. This also removes the old update registration, which can otherwise
+restore the previous skill name on a later update. Select the same agents as
+the previous installation, for example:
+
+```bash
+npx -y skills remove byted-util-ark-cua --agent codex claude-code -g -y
+```
+
+Keep the runtime state directory described below.
 
 Existing Git clones should use the current repository address:
 
